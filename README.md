@@ -230,5 +230,5 @@ Note: In byte-level mode, `vocab_size` is ignored and forced to 259. Use `lumi p
 
 I invite all who feel they have something to contribute to do so, especially if it broadens the hardware compatibility for inference or training (also, happy to merge a simple readme update to say "I ran it fine on _blank_ GPU/machine").
 
-On a personal note, this is the first from-scratch project I've worked on dealing with LLM architecture, native kernels, or Rust. This codebase has been helped a lot by AI friends. I've tried my best to keep it clean, but I'm still learning at the same time, so there may be "dumb" or unnecessary code artifacts. I greatly appreciate any and all constructive criticism or pointers. The main purpose of this project is a fun learning experience outside my normal area of development work.
+On a personal note, this is the first fully-from-scratch project I've worked on dealing with ML, native kernels, and Rust. I greatly appreciate any and all constructive criticism / helpful pointers (ha) / sage advice. The whole point of this project is a fun building experience outside my normal area of development.
 

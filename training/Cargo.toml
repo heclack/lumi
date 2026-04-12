@@ -2,7 +2,7 @@
 name = "lumi"
 version = "0.2.0"
 edition = "2021"
-description = "Lumi — a hybrid Mamba-3 language model trained on curated elementary-level data"
+description = "Lumi — a hybrid Mamba-3 language model trainer and inference"
 
 [features]
 default = ["cpu"]
