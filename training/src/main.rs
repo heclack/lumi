@@ -39,9 +39,12 @@ enum Command {
         /// Output binary file.
         #[arg(short, long)]
         output: String,
-        /// Tokenizer JSON path.
-        #[arg(short, long, default_value = "tokenizer.json")]
-        tokenizer: String,
+        /// Tokenizer JSON path (required for BPE mode, ignored for byte-level).
+        #[arg(short, long)]
+        tokenizer: Option<String>,
+        /// Use byte-level encoding (no tokenizer needed).
+        #[arg(long)]
+        byte_level: bool,
     },
     /// Train the model (native CUDA).
     Train {
@@ -68,8 +71,13 @@ fn main() {
             let paths: Vec<&str> = corpus.split(',').collect();
             lumi::tokenizer::Tokenizer::train_bpe(&paths, vocab_size, &output);
         }
-        Command::Preprocess { input, output, tokenizer } => {
-            lumi::data::preprocess(&input, &output, &tokenizer);
+        Command::Preprocess { input, output, tokenizer, byte_level } => {
+            if byte_level {
+                lumi::data::preprocess_bytes(&input, &output);
+            } else {
+                let tokenizer_path = tokenizer.unwrap_or_else(|| "tokenizer.json".to_string());
+                lumi::data::preprocess(&input, &output, &tokenizer_path);
+            }
         }
         Command::Train { config, device } => {
             let config = match config {

@@ -284,3 +284,54 @@ fn coprime_stride_different_sizes() {
         assert!(n % stride != 0, "Stride {} not coprime with {}", stride, n);
     }
 }
+
+#[test]
+fn byte_level_defaults_false() {
+    let config = ModelConfig::default();
+    assert!(!config.byte_level);
+    assert_eq!(config.vocab_size, 32000);
+}
+
+#[test]
+fn byte_level_backward_compat() {
+    // Old JSON configs without byte_level should deserialize with byte_level=false
+    let json = r#"{
+        "model": {
+            "d_model": 256, "n_layers": 4, "d_state": 16, "d_conv": 4,
+            "expand": 2, "n_heads": 8, "n_groups": 2, "chunk_size": 64,
+            "vocab_size": 1000, "max_seq_len": 128, "norm_eps": 1e-5
+        },
+        "learning_rate": 1e-3, "min_lr": 1e-4,
+        "warmup_steps": 100, "max_steps": 1000,
+        "batch_size": 4, "gradient_accumulation": 1,
+        "weight_decay": 0.1, "checkpoint_interval": 500,
+        "eval_interval": 200, "sample_interval": 500, "seed": 42
+    }"#;
+    let config: TrainingConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.model.byte_level);
+    assert_eq!(config.model.vocab_size, 1000);
+}
+
+#[test]
+fn byte_level_forces_vocab_size() {
+    // When byte_level is true, from_file should force vocab_size to 259
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let json = r#"{
+        "model": {
+            "d_model": 256, "n_layers": 4, "d_state": 16, "d_conv": 4,
+            "expand": 2, "n_heads": 8, "n_groups": 2, "chunk_size": 64,
+            "vocab_size": 32000, "max_seq_len": 128, "norm_eps": 1e-5,
+            "byte_level": true
+        },
+        "learning_rate": 1e-3, "min_lr": 1e-4,
+        "warmup_steps": 100, "max_steps": 1000,
+        "batch_size": 4, "gradient_accumulation": 1,
+        "weight_decay": 0.1, "checkpoint_interval": 500,
+        "eval_interval": 200, "sample_interval": 500, "seed": 42
+    }"#;
+    std::fs::write(&path, json).unwrap();
+    let config = TrainingConfig::from_file(path.to_str().unwrap()).unwrap();
+    assert!(config.model.byte_level);
+    assert_eq!(config.model.vocab_size, 259);
+}

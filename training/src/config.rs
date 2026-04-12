@@ -49,6 +49,10 @@ pub struct ModelConfig {
     /// Learned rotation frequencies per head per state-pair. theta=0 init = no rotation.
     #[serde(default = "default_dd_rope")]
     pub dd_rope: bool,
+    /// Use byte-level tokenization (vocab_size forced to 259: pad/bos/eos + 256 bytes).
+    /// When true, no BPE tokenizer is needed — raw UTF-8 bytes are used directly.
+    #[serde(default)]
+    pub byte_level: bool,
 }
 
 fn default_attn_n_heads() -> usize { 16 }
@@ -77,6 +81,7 @@ impl Default for ModelConfig {
             attn_window_sizes: vec![],
             attention_layers: vec![],
             dd_rope: true,
+            byte_level: false,
         }
     }
 }
@@ -278,7 +283,11 @@ impl TrainingConfig {
     /// Load config from JSON file.
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&contents)?)
+        let mut config: Self = serde_json::from_str(&contents)?;
+        if config.model.byte_level {
+            config.model.vocab_size = 259;
+        }
+        Ok(config)
     }
 
     /// Save config to JSON file.

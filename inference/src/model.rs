@@ -39,6 +39,9 @@ pub struct ModelConfig {
     pub attn_window_sizes: Vec<usize>,
     #[serde(default)]
     pub attention_layers: Vec<usize>,
+    /// Byte-level tokenization mode (vocab_size=259, no BPE tokenizer needed).
+    #[serde(default)]
+    pub byte_level: bool,
 }
 fn default_attn_n_heads() -> usize { 16 }
 fn default_attn_kv_heads() -> usize { 4 }

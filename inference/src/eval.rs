@@ -179,16 +179,33 @@ pub fn evaluate_mc(
 
 // ─── Benchmark Loaders ───────────────────────────────────────
 
-pub fn load_arc_easy(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: usize) -> Vec<McQuestion> {
-    load_qa_pairs(path, tokenizer, max_questions)
+/// Byte-level encoding: each UTF-8 byte maps to ID = byte_value + 3.
+fn encode_bytes(text: &str) -> Vec<u32> {
+    text.as_bytes().iter().map(|&b| b as u32 + 3).collect()
 }
 
-pub fn load_boolq(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: usize) -> Vec<McQuestion> {
+/// Build an encode function from an optional tokenizer. Uses byte-level if None.
+fn make_encode_fn(tokenizer: Option<&tokenizers::Tokenizer>) -> Box<dyn Fn(&str) -> Vec<u32> + '_> {
+    match tokenizer {
+        Some(tok) => Box::new(move |text: &str| {
+            tok.encode(text, false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default()
+        }),
+        None => Box::new(encode_bytes),
+    }
+}
+
+pub fn load_arc_easy(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
+    load_qa_pairs(path, encode_fn, max_questions)
+}
+
+pub fn load_boolq(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
     let content = std::fs::read_to_string(path).expect("failed to read boolq");
     let mut questions = Vec::new();
 
-    let yes_tokens = encode(tokenizer, " Yes");
-    let no_tokens = encode(tokenizer, " No");
+    let yes_tokens = encode_fn(" Yes");
+    let no_tokens = encode_fn(" No");
 
     for block in content.split("\n\n") {
         if questions.len() >= max_questions { break; }
@@ -205,7 +222,7 @@ pub fn load_boolq(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: 
             last.trim_end_matches("Yes.").trim_end_matches("No.").trim_end_matches("Yes").trim_end_matches("No").trim().to_string()
         };
 
-        let context = encode(tokenizer, &ctx_text);
+        let context = encode_fn(&ctx_text);
         let label = if is_yes { 0 } else { 1 };
 
         questions.push(McQuestion { context, choices: vec![yes_tokens.clone(), no_tokens.clone()], label });
@@ -213,11 +230,11 @@ pub fn load_boolq(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: 
     questions
 }
 
-pub fn load_winogrande(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: usize) -> Vec<McQuestion> {
-    load_qa_pairs(path, tokenizer, max_questions)
+pub fn load_winogrande(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
+    load_qa_pairs(path, encode_fn, max_questions)
 }
 
-fn load_qa_pairs(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: usize) -> Vec<McQuestion> {
+fn load_qa_pairs(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
     let content = std::fs::read_to_string(path).expect("failed to read benchmark file");
     let mut questions = Vec::new();
     let mut all_answers: Vec<Vec<u32>> = Vec::new();
@@ -225,7 +242,7 @@ fn load_qa_pairs(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: u
     for block in content.split("\n\n") {
         let lines: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.len() >= 2 {
-            all_answers.push(encode(tokenizer, lines.last().unwrap()));
+            all_answers.push(encode_fn(lines.last().unwrap()));
         }
     }
     if all_answers.len() < 4 { return questions; }
@@ -237,7 +254,7 @@ fn load_qa_pairs(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: u
         let lines: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.len() < 2 { continue; }
 
-        let context = encode(tokenizer, lines[0]);
+        let context = encode_fn(lines[0]);
         let correct = all_answers[idx].clone();
 
         use rand::seq::SliceRandom;
@@ -262,12 +279,6 @@ fn load_qa_pairs(path: &str, tokenizer: &tokenizers::Tokenizer, max_questions: u
     questions
 }
 
-fn encode(tokenizer: &tokenizers::Tokenizer, text: &str) -> Vec<u32> {
-    tokenizer.encode(text, false)
-        .map(|e| e.get_ids().to_vec())
-        .unwrap_or_default()
-}
-
 pub fn generation_prompts() -> Vec<(&'static str, &'static str)> {
     vec![
         ("story_start", "Once upon a time, a little girl named Lily"),
@@ -287,12 +298,15 @@ pub fn generation_prompts() -> Vec<(&'static str, &'static str)> {
 pub fn run_eval(
     model: &NmModel,
     config: &ModelConfig,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: Option<&tokenizers::Tokenizer>,
     device: &Device,
     val_data: &str,
     data_dir: &str,
 ) {
-    eprintln!("=== Lumi Evaluation Suite ===\n");
+    eprintln!("=== Lumi Evaluation Suite{} ===\n",
+        if config.byte_level { " (byte-level)" } else { "" });
+
+    let encode_fn = make_encode_fn(tokenizer);
 
     // --- Perplexity ---
     eprintln!("--- Perplexity ---");
@@ -309,19 +323,24 @@ pub fn run_eval(
     // --- Multiple Choice ---
     let mc_max = 200;
 
-    let benchmarks: Vec<(&str, String, fn(&str, &tokenizers::Tokenizer, usize) -> Vec<McQuestion>)> = vec![
-        ("ARC-Easy", format!("{}/educational/arc-easy.txt", data_dir), load_arc_easy),
-        ("BoolQ", format!("{}/educational/boolq.txt", data_dir), load_boolq),
-        ("WinoGrande", format!("{}/educational/winogrande.txt", data_dir), load_winogrande),
+    let benchmark_configs: Vec<(&str, String)> = vec![
+        ("ARC-Easy", format!("{}/educational/arc-easy.txt", data_dir)),
+        ("BoolQ", format!("{}/educational/boolq.txt", data_dir)),
+        ("WinoGrande", format!("{}/educational/winogrande.txt", data_dir)),
     ];
 
-    for (name, path, loader) in &benchmarks {
+    for (name, path) in &benchmark_configs {
         if !std::path::Path::new(path.as_str()).exists() {
             eprintln!("--- {} ---\n  File not found: {}\n", name, path);
             continue;
         }
         eprintln!("--- {} ---", name);
-        let questions = loader(path, tokenizer, mc_max);
+        let questions = match *name {
+            "ARC-Easy" => load_arc_easy(path, &*encode_fn, mc_max),
+            "BoolQ" => load_boolq(path, &*encode_fn, mc_max),
+            "WinoGrande" => load_winogrande(path, &*encode_fn, mc_max),
+            _ => continue,
+        };
         if questions.is_empty() {
             eprintln!("  No questions loaded\n");
             continue;

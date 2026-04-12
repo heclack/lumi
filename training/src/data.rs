@@ -47,6 +47,45 @@ pub fn preprocess(input_path: &str, output_path: &str, tokenizer_path: &str) {
     eprintln!("Preprocessed {} lines → {} tokens → {}", lines_read, tokens.len(), output_path);
 }
 
+/// Pre-process a text file to binary u32 using byte-level encoding (no tokenizer).
+/// Each UTF-8 byte maps to ID = byte_value + 3. pad=0, bos=1, eos=2.
+pub fn preprocess_bytes(input_path: &str, output_path: &str) {
+    let file = fs::File::open(input_path).expect("failed to open input file");
+    let reader = BufReader::with_capacity(1 << 20, file);
+
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut lines_read = 0u64;
+
+    let bos: u32 = 1;
+    let eos: u32 = 2;
+
+    for line in reader.lines() {
+        let line = line.expect("failed to read line");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        tokens.push(bos);
+        for &byte in line.as_bytes() {
+            tokens.push(byte as u32 + 3);
+        }
+        tokens.push(eos);
+
+        lines_read += 1;
+        if lines_read % 100_000 == 0 {
+            eprintln!("  byte-encoded {}k lines, {} tokens...", lines_read / 1000, tokens.len());
+        }
+    }
+
+    let mut out = fs::File::create(output_path).expect("failed to create output file");
+    for &t in &tokens {
+        out.write_all(&t.to_le_bytes()).expect("failed to write");
+    }
+
+    eprintln!("Byte-encoded {} lines → {} tokens → {}", lines_read, tokens.len(), output_path);
+}
+
 /// Binary token dataset for training.
 pub struct TokenDataset {
     pub tokens: Vec<u32>,

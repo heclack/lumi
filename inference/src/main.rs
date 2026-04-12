@@ -32,8 +32,9 @@ enum Command {
         model: String,
         #[arg(short, long)]
         config: String,
+        /// Tokenizer JSON path (required for BPE mode, omit for byte-level).
         #[arg(short, long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
         #[arg(short, long)]
         prompt: String,
         #[arg(long, default_value = "200")]
@@ -47,8 +48,9 @@ enum Command {
         model: String,
         #[arg(short, long)]
         config: String,
+        /// Tokenizer JSON path (required for BPE mode, omit for byte-level).
         #[arg(short, long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
         /// Path to val.bin for perplexity
         #[arg(long, default_value = "data/val.bin")]
         val_data: String,
@@ -72,9 +74,13 @@ fn select_device(cpu: bool) -> Device {
 
 fn load_model(model_path: &str, config_path: &str, device: &Device) -> anyhow::Result<(NmModel, ModelConfig)> {
     eprintln!("Loading config: {}", config_path);
-    let config: ModelConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-    eprintln!("Model: d_model={}, layers={}, heads={}, vocab={}",
-        config.d_model, config.n_layers, config.n_heads, config.vocab_size);
+    let mut config: ModelConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    if config.byte_level {
+        config.vocab_size = 259;
+    }
+    eprintln!("Model: d_model={}, layers={}, heads={}, vocab={}{}",
+        config.d_model, config.n_layers, config.n_heads, config.vocab_size,
+        if config.byte_level { " (byte-level)" } else { "" });
 
     eprintln!("Loading model: {}", model_path);
     let vb = unsafe {
@@ -91,15 +97,26 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Generate { model, config, tokenizer, prompt, max_tokens, temperature } => {
-            let (model, _config) = load_model(&model, &config, &device)?;
+            let (model, model_config) = load_model(&model, &config, &device)?;
 
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+            // Encode prompt and set up decode function based on mode
+            let (prompt_ids, eos_id, tok): (Vec<u32>, u32, Option<tokenizers::Tokenizer>) =
+                if model_config.byte_level {
+                    let ids: Vec<u32> = prompt.as_bytes().iter().map(|&b| b as u32 + 3).collect();
+                    (ids, 2u32, None)
+                } else {
+                    let tok_path = tokenizer.as_deref().unwrap_or("tokenizer.json");
+                    let tok = tokenizers::Tokenizer::from_file(tok_path)
+                        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+                    let encoding = tok.encode(prompt.as_str(), false)
+                        .map_err(|e| anyhow::anyhow!("Failed to encode: {}", e))?;
+                    let ids = encoding.get_ids().to_vec();
+                    let eos = tok.token_to_id("<eos>").unwrap_or(2);
+                    (ids, eos, Some(tok))
+                };
 
-            let encoding = tokenizer.encode(prompt.as_str(), false)
-                .map_err(|e| anyhow::anyhow!("Failed to encode: {}", e))?;
-            let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-            eprintln!("Prompt: {} tokens", prompt_ids.len());
+            eprintln!("Prompt: {} tokens{}", prompt_ids.len(),
+                if model_config.byte_level { " (byte-level)" } else { "" });
 
             let mut states = model.init_states(&device)?;
 
@@ -118,7 +135,6 @@ fn main() -> anyhow::Result<()> {
             print!("{}", prompt);
             let mut generated = Vec::new();
             let gen_start = std::time::Instant::now();
-            let eos_id = tokenizer.token_to_id("<eos>").unwrap_or(2);
 
             for _ in 0..max_tokens {
                 let logits = match &last_logits {
@@ -137,11 +153,21 @@ fn main() -> anyhow::Result<()> {
                 if next_token == eos_id { break; }
                 generated.push(next_token);
 
-                if let Ok(text) = tokenizer.decode(&[next_token], true) {
-                    print!("{}", text);
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
+                // Decode and print
+                if model_config.byte_level {
+                    if next_token >= 3 && next_token < 259 {
+                        let byte = (next_token - 3) as u8;
+                        if let Ok(ch) = std::str::from_utf8(&[byte]) {
+                            print!("{}", ch);
+                        }
+                    }
+                } else if let Some(ref tok) = tok {
+                    if let Ok(text) = tok.decode(&[next_token], true) {
+                        print!("{}", text);
+                    }
                 }
+                use std::io::Write;
+                std::io::stdout().flush()?;
 
                 last_logits = Some(model.forward_step(next_token, &mut states, &device)?);
             }
@@ -156,10 +182,15 @@ fn main() -> anyhow::Result<()> {
         Command::Evaluate { model, config, tokenizer, val_data, data_dir } => {
             let (model, config) = load_model(&model, &config, &device)?;
 
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+            let tok = if config.byte_level {
+                None
+            } else {
+                let tok_path = tokenizer.as_deref().unwrap_or("tokenizer.json");
+                Some(tokenizers::Tokenizer::from_file(tok_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?)
+            };
 
-            eval::run_eval(&model, &config, &tokenizer, &device, &val_data, &data_dir);
+            eval::run_eval(&model, &config, tok.as_ref(), &device, &val_data, &data_dir);
         }
     }
 
