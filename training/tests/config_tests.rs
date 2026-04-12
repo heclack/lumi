@@ -294,3 +294,45 @@ fn byte_level_forces_vocab_size() {
     assert!(config.model.byte_level);
     assert_eq!(config.model.vocab_size, 259);
 }
+
+#[test]
+fn minimal_config_deserializes() {
+    let json = r#"{
+        "model": { "d_model": 256, "n_layers": 4, "vocab_size": 1000 },
+        "max_steps": 500
+    }"#;
+    let config: TrainingConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.model.d_model, 256);
+    assert_eq!(config.model.n_layers, 4);
+    assert_eq!(config.model.vocab_size, 1000);
+    // Everything else from Default
+    assert_eq!(config.model.d_state, 64);
+    assert_eq!(config.model.expand, 2);
+    assert_eq!(config.max_steps, 500);
+    assert_eq!(config.learning_rate, 3e-4);
+    assert_eq!(config.train_data, "data/train.bin");
+    assert_eq!(config.val_data, "data/val.bin");
+    assert_eq!(config.seq_len, 0);
+}
+
+#[test]
+fn seq_len_override() {
+    let json = r#"{
+        "model": { "max_seq_len": 2048 },
+        "seq_len": 512
+    }"#;
+    let config: TrainingConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.seq_len, 512);
+    assert_eq!(config.model.max_seq_len, 2048);
+}
+
+#[test]
+fn data_paths_configurable() {
+    let json = r#"{
+        "train_data": "/mnt/data/train.bin",
+        "val_data": "/mnt/data/val.bin"
+    }"#;
+    let config: TrainingConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.train_data, "/mnt/data/train.bin");
+    assert_eq!(config.val_data, "/mnt/data/val.bin");
+}

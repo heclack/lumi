@@ -1,8 +1,9 @@
-/// Configuration for the hybrid Mamba-3 model, training, and Goldilocks sampling.
+/// Configuration for the hybrid Mamba-3 model and training.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelConfig {
     /// Hidden dimension.
     pub d_model: usize,
@@ -10,15 +11,15 @@ pub struct ModelConfig {
     pub n_layers: usize,
     /// SSM state dimension.
     pub d_state: usize,
-    /// Causal conv kernel size.
-    pub d_conv: usize,
     /// Expansion factor (d_inner = expand * d_model).
     pub expand: usize,
     /// Number of SSM heads.
     pub n_heads: usize,
     /// Number of groups for B, C matrices.
     pub n_groups: usize,
-    /// Chunk size for SSD algorithm.
+    // TODO: chunk_size is not wired up — CUDA kernel hardcodes SSD_FWD_CHUNK=32.
+    // Wire this up when the kernel is parameterized for chunk size.
+    /// Chunk size for SSD algorithm (not yet used by CUDA kernel).
     pub chunk_size: usize,
     /// Vocabulary size.
     pub vocab_size: usize,
@@ -28,32 +29,21 @@ pub struct ModelConfig {
     pub norm_eps: f64,
     /// Attention block interval (0 = pure Mamba, 8 = attention every 8 layers).
     /// When > 0, layer i is attention if (i+1) % attention_interval == 0.
-    #[serde(default)]
     pub attention_interval: usize,
-    /// Number of query heads in attention blocks (default 16).
-    #[serde(default = "default_attn_n_heads")]
+    /// Number of query heads in attention blocks.
     pub attn_n_heads: usize,
-    /// Number of KV heads for GQA in attention blocks (default 4).
-    #[serde(default = "default_attn_kv_heads")]
+    /// Number of KV heads for GQA in attention blocks.
     pub attn_kv_heads: usize,
-    /// MLP expand factor in attention blocks (default 4).
-    #[serde(default = "default_attn_mlp_expand")]
+    /// MLP expand factor in attention blocks.
     pub attn_mlp_expand: usize,
-    /// Sliding window sizes per attention layer. Empty = full causal (default).
-    #[serde(default)]
+    /// Sliding window sizes per attention layer. Empty = full causal.
     pub attn_window_sizes: Vec<usize>,
     /// Explicit attention layer indices (0-indexed). Overrides attention_interval if non-empty.
-    #[serde(default)]
     pub attention_layers: Vec<usize>,
     /// Use byte-level tokenization (vocab_size forced to 259: pad/bos/eos + 256 bytes).
     /// When true, no BPE tokenizer is needed — raw UTF-8 bytes are used directly.
-    #[serde(default)]
     pub byte_level: bool,
 }
-
-fn default_attn_n_heads() -> usize { 16 }
-fn default_attn_kv_heads() -> usize { 4 }
-fn default_attn_mlp_expand() -> usize { 4 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
@@ -61,7 +51,6 @@ impl Default for ModelConfig {
             d_model: 1024,
             n_layers: 48,
             d_state: 64,
-            d_conv: 4,
             expand: 2,
             n_heads: 64,
             n_groups: 8,
@@ -69,7 +58,7 @@ impl Default for ModelConfig {
             vocab_size: 32000,
             max_seq_len: 2048,
             norm_eps: 1e-5,
-            attention_interval: 0, // 0 = pure Mamba (default), 8 = hybrid
+            attention_interval: 0,
             attn_n_heads: 16,
             attn_kv_heads: 4,
             attn_mlp_expand: 4,
@@ -175,6 +164,7 @@ impl ModelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrainingConfig {
     pub model: ModelConfig,
     /// Peak learning rate.
@@ -195,24 +185,22 @@ pub struct TrainingConfig {
     pub checkpoint_interval: usize,
     /// Steps between validation runs.
     pub eval_interval: usize,
-    /// Steps between sample generation.
-    pub sample_interval: usize,
-    /// RNG seed.
+    /// RNG seed for reproducible weight initialization and data sampling.
     pub seed: u64,
-    /// LR schedule: "wsd" (warmup-stable-decay, default) or "cosine".
-    #[serde(default = "default_lr_schedule")]
+    /// LR schedule: "wsd" (warmup-stable-decay) or "cosine".
     pub lr_schedule: String,
-    /// For WSD: fraction of steps spent in decay phase (default 0.2 = last 20%).
-    #[serde(default = "default_decay_fraction")]
+    /// For WSD: fraction of steps spent in decay phase.
     pub decay_fraction: f64,
     /// Offset warmup to start at this step (for checkpoint resume with re-warm).
     /// When set, warmup runs from warmup_offset to warmup_offset + warmup_steps.
-    #[serde(default)]
     pub warmup_offset: usize,
+    /// Path to training data binary file.
+    pub train_data: String,
+    /// Path to validation data binary file.
+    pub val_data: String,
+    /// Training sequence length. 0 = use model.max_seq_len.
+    pub seq_len: usize,
 }
-
-fn default_lr_schedule() -> String { "wsd".to_string() }
-fn default_decay_fraction() -> f64 { 0.2 }
 
 impl Default for TrainingConfig {
     fn default() -> Self {
@@ -227,11 +215,13 @@ impl Default for TrainingConfig {
             weight_decay: 0.1,
             checkpoint_interval: 500,
             eval_interval: 200,
-            sample_interval: 1000,
             seed: 42,
             lr_schedule: "wsd".to_string(),
             decay_fraction: 0.2,
             warmup_offset: 0,
+            train_data: "data/train.bin".to_string(),
+            val_data: "data/val.bin".to_string(),
+            seq_len: 0,
         }
     }
 }

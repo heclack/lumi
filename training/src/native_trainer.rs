@@ -218,7 +218,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
     }
 
     let batch = config.batch_size;
-    let seq = config.model.max_seq_len;
+    let seq = if config.seq_len > 0 { config.seq_len } else { config.model.max_seq_len };
     let bs = batch * seq;
     let d_model = config.model.d_model;
     let d_inner = config.model.d_inner();
@@ -291,15 +291,18 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
     };
 
     // Load dataset
-    let dataset = if std::path::Path::new("data/train.bin").exists() {
-        eprintln!("Loading dataset: data/train.bin");
-        TokenDataset::from_binary("data/train.bin", seq)
+    let dataset = if std::path::Path::new(&config.train_data).exists() {
+        eprintln!("Loading dataset: {}", config.train_data);
+        TokenDataset::from_binary(&config.train_data, seq)
     } else {
-        panic!("data/train.bin not found — run preprocessing first");
+        panic!("{} not found — run preprocessing first", config.train_data);
     };
     eprintln!("Dataset: {} tokens, {} windows", dataset.tokens.len(), dataset.len());
 
-    let mut rng = rand::thread_rng();
+    let mut rng = {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(config.seed)
+    };
     let start_time = std::time::Instant::now();
 
     eprintln!("Starting native training: {} steps, batch={}, seq={}",
@@ -308,8 +311,8 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
     eprintln!();
 
     // Load validation dataset if available
-    let val_dataset = if std::path::Path::new("data/val.bin").exists() {
-        Some(TokenDataset::from_binary("data/val.bin", seq))
+    let val_dataset = if std::path::Path::new(&config.val_data).exists() {
+        Some(TokenDataset::from_binary(&config.val_data, seq))
     } else {
         None
     };
@@ -1348,7 +1351,6 @@ pub fn smoke_test_configs() {
         d_model: 128,
         n_layers: 8,
         d_state: 16,
-        d_conv: 4,
         expand: 2,
         n_heads: 8,
         n_groups: 2,
@@ -1526,7 +1528,8 @@ pub fn smoke_test_configs() {
 #[cfg(feature = "cuda")]
 fn init_weights_random(buf: &mut TrainingBuffers, config: &TrainingConfig) {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
     let std_dev = 0.02f32;
     let n_layers = config.model.n_layers;
     let residual_scale = 1.0 / (2.0 * n_layers as f32).sqrt();

@@ -33,7 +33,7 @@ fn in_proj_out_default_config() {
 #[test]
 fn in_proj_out_small_config() {
     let config = ModelConfig {
-        d_model: 128, n_layers: 4, d_state: 16, d_conv: 4,
+        d_model: 128, n_layers: 4, d_state: 16,
         expand: 2, n_heads: 8, n_groups: 2, chunk_size: 64,
         vocab_size: 1000, max_seq_len: 128, norm_eps: 1e-5,
         ..ModelConfig::default()
