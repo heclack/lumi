@@ -1,0 +1,22 @@
+[package]
+name = "lumi-inference"
+version = "0.1.0"
+edition = "2021"
+description = "Lumi Mamba-3 inference on Apple Silicon via Metal"
+
+[[bin]]
+name = "lumi-infer"
+path = "src/main.rs"
+
+[dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+candle-nn = "0.9"
+safetensors = "0.4"
+tokenizers = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+anyhow = "1"
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3.2"

@@ -1,0 +1,3 @@
+[workspace]
+members = ["training", "inference"]
+resolver = "2"

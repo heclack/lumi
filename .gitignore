@@ -1,0 +1,15 @@
+# Build artifacts
+target/
+
+# Model weights (too large for git)
+*.safetensors
+
+# Runtime artifacts
+checkpoints/
+*.log
+
+# OS
+.DS_Store
+
+# Environment
+.env
