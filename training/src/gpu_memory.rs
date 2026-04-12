@@ -3,7 +3,8 @@
 /// Pre-allocates ALL training buffers at init. Zero cudaMalloc during training.
 /// Activations reuse buffers across layers (ping-pong pattern).
 
-/// Must match CHUNK_SIZE in csrc/ssm_scan.cu backward kernel.
+/// Backward kernel checkpoint granularity: timesteps replayed between saved states.
+/// Distinct from config.chunk_size (SSD forward tiling). Must match CHUNK_SIZE in csrc/ssm_scan.cu backward kernel.
 pub const SSM_BWD_CHUNK_SIZE: usize = 8;
 
 use std::ptr;

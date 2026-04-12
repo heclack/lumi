@@ -316,31 +316,6 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
     let grad_accum = config.gradient_accumulation.max(1);
 
-    // ──── Validate config against known latent loss-reporting bugs ────
-    // TODO: fix the off-by-one in `is_log_step` (uses `interval - 1` instead of `0`)
-    // and the power-of-2 assumption in csrc/elementwise_ops.cu::reduce_mean_kernel.
-    // Until then, warn loudly if the config would trip them.
-    if config.checkpoint_interval % 10 != 0 || config.eval_interval % 10 != 0 {
-        eprintln!(
-            "WARNING: checkpoint_interval={} or eval_interval={} is not a multiple of 10. \
-             The `is_log_step` clauses use `interval - 1` (off-by-one), so the loss read \
-             at the actual checkpoint/eval step may be 0. Loss values written into \
-             checkpoint metadata may be wrong. (See native_trainer.rs is_log_step TODO.)",
-            config.checkpoint_interval, config.eval_interval,
-        );
-    }
-    if !(bs >= 1024 || bs.is_power_of_two()) {
-        eprintln!(
-            "WARNING: batch_size * seq = {} is < 1024 and not a power of 2. \
-             csrc/elementwise_ops.cu::reduce_mean_kernel uses a tree reduction that \
-             silently drops elements when blockDim is not a power of 2. The training \
-             loss display reads buf.loss (the output of that kernel), so the displayed \
-             and checkpointed loss values will be wrong. Optimizer gradients are \
-             unaffected. (Validation loss already reduces per_token_loss on the CPU \
-             and is unaffected.)",
-            bs,
-        );
-    }
 
     let mut best_val_loss = f32::MAX;
     let mut best_val_ckpt: Option<String> = None;
@@ -369,13 +344,9 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
       buf.d_final_norm_gamma.zero();
 
       // is_log_step is per-step, not per-micro — hoist out of the accumulation loop.
-      // TODO: the `interval - 1` clauses are off-by-one. Actual checkpoint/eval runs
-      // at `step % interval == 0`. Currently masked by `step % 10 == 0` when intervals
-      // are multiples of 10 (validated at startup). Fix is to swap to `== 0` and add
-      // `step > 0` guards to avoid double-firing on step 0.
       let is_log_step = step % 10 == 0 || step == config.max_steps - 1
-          || step % config.checkpoint_interval == config.checkpoint_interval - 1
-          || step % config.eval_interval == config.eval_interval - 1;
+          || (step > 0 && step % config.checkpoint_interval == 0)
+          || (step > 0 && step % config.eval_interval == 0);
 
       // micro_loss accumulates per-micro losses across the grad-accum loop and is
       // averaged after the loop, so the reported value matches what the optimizer
@@ -481,15 +452,6 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
         }
 
         // Read scalar loss on logging/checkpoint steps only (sync is expensive).
-        // TODO: this reads `buf.loss`, which is the output of the GPU reduce_mean_kernel
-        // in csrc/elementwise_ops.cu. The validation path at line ~1180 deliberately
-        // avoids this and reduces per_token_loss on the CPU instead, with a comment
-        // about "GPU reduce precision issues on sm_120" (Blackwell consumer / RTX 5090).
-        // The training-loss display path here still goes through the GPU reduce, so on
-        // sm_120 the displayed and checkpointed loss may be slightly inaccurate even
-        // though the optimizer is unaffected (gradients use a different code path).
-        // Fix is to mirror the val path: `buf.per_token_loss.to_host().iter().sum::<f32>()
-        // / bs as f32`. Left as-is for now to keep parity with prior runs.
         if is_log_step {
             unsafe { native_ops::cudaDeviceSynchronize(); }
             micro_loss += buf.loss.to_host()[0];

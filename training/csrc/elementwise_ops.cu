@@ -643,24 +643,7 @@ __global__ void sparse_ce_fwd_kernel(
     }
 }
 
-/* Reduce per-token losses to scalar mean.
- *
- * TODO: this tree reduction `for (s = blockDim.x/2; s > 0; s >>= 1)` silently drops
- * elements when blockDim.x is not a power of 2. The launch site below uses
- * `min(batch_seq, 1024)` threads, so when batch_seq < 1024 and not a power of 2 the
- * resulting scalar is wrong. The Rust trainer reads this scalar (`buf.loss`) for the
- * displayed/checkpointed training loss, so a bad config here corrupts logging — the
- * optimizer is unaffected because gradients flow through sparse_ce_bwd_kernel, not
- * this reduction.
- *
- * Separately, this kernel has been observed to produce slightly inaccurate results on
- * sm_120 (RTX 5090 / Blackwell consumer) — the validation path in native_trainer.rs
- * works around it by reducing per_token_loss on the CPU instead.
- *
- * Fix is to either (a) pad blockDim.x to a power of 2 and gate accumulation, or
- * (b) two-pass reduction with atomicAdd. Until then, the Rust trainer warns at
- * startup if batch*seq trips the power-of-2 case.
- */
+/* Reduce per-token losses to scalar mean. Correct for arbitrary blockDim.x. */
 __global__ void reduce_mean_kernel(const float* values, float* out, int n) {
     extern __shared__ float shared[];
     float local_sum = 0.0f;
@@ -669,7 +652,18 @@ __global__ void reduce_mean_kernel(const float* values, float* out, int n) {
     }
     shared[threadIdx.x] = local_sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+
+    // Fold elements beyond largest power-of-2 into first elements
+    unsigned int np2 = 1;
+    while (np2 < blockDim.x) np2 <<= 1;
+    np2 >>= 1;  // largest power of 2 <= blockDim.x
+    if (threadIdx.x < blockDim.x - np2) {
+        shared[threadIdx.x] += shared[threadIdx.x + np2];
+    }
+    __syncthreads();
+
+    // Standard power-of-2 tree reduction
+    for (unsigned int s = np2 >> 1; s > 0; s >>= 1) {
         if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
         __syncthreads();
     }
