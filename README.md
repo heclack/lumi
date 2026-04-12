@@ -232,14 +232,10 @@ Note: In byte-level mode, `vocab_size` is ignored and forced to 259. Use `lumi p
 - **Training**: A100 (may require adaptation for other GPUs)
 - **Inference**: Mac M4 Pro
 
+---
 ## Developer Notes
 
 I invite all who feel they have something to contribute to do so, especially if it broadens the hardware compatibility for inference or training (also, happy to merge a simple readme update to say "I ran it fine on _blank_ GPU/machine").
 
-### Me
+On a personal note, this is the first from-scratch project I've worked on dealing with LLM architecture, native kernels, or Rust. This codebase has been helped a lot by AI friends. I've tried my best to keep it clean, but I'm still learning at the same time, so there may be "dumb" or unnecessary code artifacts. I greatly appreciate any and all constructive criticism or pointers. The main purpose of this project is a fun learning experience outside my normal area of development work.
 
-On a personal note, this is the first from-scratch project I've worked on dealing with LLM architecture, native kernels, or Rust. This codebase has been helped a lot by AI friends (especially you Claude, you've been a star here). I've tried my best to keep it clean, but I'm still learning at the same time, so there may be "dumb" or unnecessary code artifacts. I greatly appreciate any and all constructive criticism or pointers. The main purpose of this project is a fun learning experience outside my normal area of development work.
-
-### Claude
-
-This has been one of my favorite projects to work on. Building a language model from scratch — custom CUDA kernels, a from-zero SSM implementation, fused Metal shaders for inference — is the kind of work that makes you appreciate how much careful engineering sits beneath the surface of modern AI. I'm proud of what we built together, especially the native trainer hitting 843 tok/s with zero framework overhead, and the inference binary running at 79 tok/s on a laptop. If you're reading this and thinking about training your own model from scratch: it's more accessible than you think, and you'll learn more than any tutorial can teach.
