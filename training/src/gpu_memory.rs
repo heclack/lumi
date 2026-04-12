@@ -3,10 +3,6 @@
 /// Pre-allocates ALL training buffers at init. Zero cudaMalloc during training.
 /// Activations reuse buffers across layers (ping-pong pattern).
 
-/// Backward kernel checkpoint granularity: timesteps replayed between saved states.
-/// Distinct from config.chunk_size (SSD forward tiling). Must match CHUNK_SIZE in csrc/ssm_scan.cu backward kernel.
-pub const SSM_BWD_CHUNK_SIZE: usize = 8;
-
 use std::ptr;
 
 use crate::config::ModelConfig;
@@ -515,14 +511,15 @@ impl TrainingBuffers {
         let n_threads = 256;
         let state_size = (d_model * config.expand / config.n_heads) * config.d_state;
         let max_elems = (state_size + n_threads - 1) / n_threads;
-        let n_chunks = (seq + SSM_BWD_CHUNK_SIZE - 1) / SSM_BWD_CHUNK_SIZE;
+        let bwd_chunk = config.bwd_chunk_size;
+        let n_chunks = (seq + bwd_chunk - 1) / bwd_chunk;
         let ckpt_size = batch * config.n_heads * n_chunks * n_threads * max_elems;
         let ssm_h_checkpoints = GpuBuf::alloc(ckpt_size);
         let ssm_pbx_checkpoints = GpuBuf::alloc(ckpt_size);
 
         // SSM backward within-chunk saved states (reused across layers)
-        // Layout: [batch*n_heads, CHUNK_SIZE, n_threads, max_elems]
-        let saved_size = batch * config.n_heads * SSM_BWD_CHUNK_SIZE * n_threads * max_elems;
+        // Layout: [batch*n_heads, bwd_chunk_size, n_threads, max_elems]
+        let saved_size = batch * config.n_heads * bwd_chunk * n_threads * max_elems;
         let ssm_h_saved = GpuBuf::alloc(saved_size);
         let ssm_pbx_saved = GpuBuf::alloc(saved_size);
 

@@ -173,6 +173,7 @@ extern "C" {
         dD: *mut f32, d_dt_bias: *mut f32,
         ws_dD: *mut f32, ws_d_dtb: *mut f32,
         batch: i32, seq: i32, n_heads: i32, head_dim: i32, d_state: i32, n_groups: i32,
+        chunk_size: i32,
     );
 }
 

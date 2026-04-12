@@ -138,6 +138,20 @@ Training is controlled by a JSON config file. All fields have sensible defaults 
 | `max_seq_len` | 2048 | Maximum sequence length | |
 | `norm_eps` | 1e-5 | RMSNorm epsilon | |
 | `byte_level` | false | Byte-level tokenization mode | When true, vocab_size is forced to 259 (pad/bos/eos + 256 bytes). No tokenizer needed. |
+| `bwd_chunk_size` | 8 | SSM backward activation checkpoint granularity | Must be 4, 8, 16, or 32. Smaller = more memory, less recompute. See below. |
+
+#### SSM Backward Chunk Size
+
+Controls the memory/compute tradeoff for the SSM backward pass. The backward kernel saves hidden state checkpoints every `bwd_chunk_size` timesteps, then replays forward within each chunk to reconstruct intermediate states for gradient computation.
+
+| `bwd_chunk_size` | Checkpoint Memory | Recompute Overhead |
+|-------------------|------------------|--------------------|
+| 4 | ~2.0 GB | 75% |
+| **8** (default) | **~1.1 GB** | **88%** |
+| 16 | ~0.6 GB | 94% |
+| 32 | ~0.5 GB | 97% |
+
+Memory shown for 96-layer model (batch=8, seq=1024, n_heads=64, d_state=64). Buffers are shared across all layers. Recompute overhead applies only to the SSM scan portion of each step (a small fraction of total step time, which is dominated by matmuls).
 
 #### Attention (Hybrid Mode)
 

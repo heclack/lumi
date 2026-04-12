@@ -772,6 +772,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                     buf.ws_d_d_buf.ptr, buf.ws_d_dtb_buf.ptr,
                     batch as i32, seq as i32, n_heads as i32,
                     head_dim as i32, d_state as i32, n_groups as i32,
+                    config.model.bwd_chunk_size as i32,
                 );
             }
 

@@ -42,7 +42,8 @@ void ssm_scan_bwd_gpu_v2(
     float* d_d_theta, float* d_d_A_vals,
     float* d_dD, float* d_d_dt_bias,
     float* ws_dD_buf, float* ws_d_dtb_buf,
-    int batch, int seq, int n_heads, int head_dim, int d_state, int n_groups
+    int batch, int seq, int n_heads, int head_dim, int d_state, int n_groups,
+    int chunk_size
 );
 
 #ifdef __cplusplus

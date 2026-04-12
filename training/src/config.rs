@@ -43,6 +43,10 @@ pub struct ModelConfig {
     /// Use byte-level tokenization (vocab_size forced to 259: pad/bos/eos + 256 bytes).
     /// When true, no BPE tokenizer is needed — raw UTF-8 bytes are used directly.
     pub byte_level: bool,
+    /// Backward pass activation checkpoint chunk size. Controls the memory/recompute
+    /// tradeoff in SSM backward: smaller = more memory (more checkpoints), less recompute.
+    /// Larger = less memory, more recompute. Must be one of: 4, 8, 16, 32.
+    pub bwd_chunk_size: usize,
 }
 
 impl Default for ModelConfig {
@@ -65,6 +69,7 @@ impl Default for ModelConfig {
             attn_window_sizes: vec![],
             attention_layers: vec![],
             byte_level: false,
+            bwd_chunk_size: 8,
         }
     }
 }

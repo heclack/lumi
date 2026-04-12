@@ -336,3 +336,18 @@ fn data_paths_configurable() {
     assert_eq!(config.train_data, "/mnt/data/train.bin");
     assert_eq!(config.val_data, "/mnt/data/val.bin");
 }
+
+#[test]
+fn bwd_chunk_size_default() {
+    let config = ModelConfig::default();
+    assert_eq!(config.bwd_chunk_size, 8);
+}
+
+#[test]
+fn bwd_chunk_size_configurable() {
+    let json = r#"{
+        "model": { "bwd_chunk_size": 32 }
+    }"#;
+    let config: TrainingConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.model.bwd_chunk_size, 32);
+}

@@ -245,6 +245,7 @@ __global__ void ssm_ssd_fwd_kernel(
  *   d_lambda, d_h_init, d_theta (per-position), d_A_vals (per-position)
  */
 
+template<int CHUNK_SIZE>
 __global__ void ssm_scan_bwd_kernel(
     const float* __restrict__ x,        // [batch, seq, n_heads, head_dim]
     const float* __restrict__ dt,       // [batch, seq, n_heads]
@@ -331,12 +332,10 @@ __global__ void ssm_scan_bwd_kernel(
     __syncthreads();
 
     // Per-thread DD-RoPE state (tid < half_d_state only)
-    float my_cum_angle_saved[8];   // cumulative rotation angle at each timestep within a chunk
-    float my_dt_pos_saved[8];      // per-timestep dt_pos for theta gradient chain rule
+    float my_cum_angle_saved[CHUNK_SIZE];   // cumulative rotation angle at each timestep within a chunk
+    float my_dt_pos_saved[CHUNK_SIZE];      // per-timestep dt_pos for theta gradient chain rule
     float my_theta_val = 0.0f;     // tanh-bounded theta * pi
     float d_angle_accum = 0.0f;    // reverse-cumsum of d_angle for backprop
-
-    const int CHUNK_SIZE = 8;
 
     // Per-thread state arrays (must match forward kernel's h[16])
     #define MAX_ELEMS 16
@@ -365,8 +364,8 @@ __global__ void ssm_scan_bwd_kernel(
     int saved_block_base = block_id * CHUNK_SIZE * saved_step_stride;
 
     // cum_angle_boundary: 1 float per chunk, only tid < half_d_state
-    // max_seq_len=2048, CHUNK_SIZE=8 → max 256 chunks
-    float cum_angle_boundary[256];
+    // max_seq_len=2048, CHUNK_SIZE=4 → max 512 chunks
+    float cum_angle_boundary[512];
 
     // ── Forward pass: save h/prev_bx at chunk boundaries to external buffers ──
     for (int chunk = 0; chunk < n_chunks; chunk++) {
@@ -820,7 +819,8 @@ void ssm_scan_bwd_gpu_v2(
     float* d_d_A_vals,
     float* d_dD, float* d_d_dt_bias,
     float* ws_dD_buf, float* ws_d_dtb_buf,
-    int batch, int seq, int n_heads, int head_dim, int d_state, int n_groups
+    int batch, int seq, int n_heads, int head_dim, int d_state, int n_groups,
+    int chunk_size
 ) {
     int n_blocks = batch * n_heads;
     int n_threads = 256;
@@ -836,15 +836,27 @@ void ssm_scan_bwd_gpu_v2(
     cudaMemset(d_d_lambda, 0, dt_size);
     cudaMemset(d_d_A_vals, 0, dt_size);
 
-    ssm_scan_bwd_kernel<<<n_blocks, n_threads, shared_mem>>>(
-        d_x, d_dt, d_b, d_c, d_D, d_dt_bias, d_dy, d_lambda_in,
-        d_h_init, d_h_checkpoints, d_pbx_checkpoints,
-        d_h_saved_buf, d_pbx_saved_buf,
-        d_theta_in, d_A_vals_in,
-        d_dx, d_ddt, d_db, d_dc, d_d_lambda, d_d_h_init, d_d_theta, d_d_A_vals,
-        ws_dD_buf, ws_d_dtb_buf,
-        seq, n_heads, head_dim, d_state, n_groups
-    );
+    #define LAUNCH_BWD(CS) \
+        ssm_scan_bwd_kernel<CS><<<n_blocks, n_threads, shared_mem>>>( \
+            d_x, d_dt, d_b, d_c, d_D, d_dt_bias, d_dy, d_lambda_in, \
+            d_h_init, d_h_checkpoints, d_pbx_checkpoints, \
+            d_h_saved_buf, d_pbx_saved_buf, \
+            d_theta_in, d_A_vals_in, \
+            d_dx, d_ddt, d_db, d_dc, d_d_lambda, d_d_h_init, d_d_theta, d_d_A_vals, \
+            ws_dD_buf, ws_d_dtb_buf, \
+            seq, n_heads, head_dim, d_state, n_groups \
+        )
+
+    switch (chunk_size) {
+        case 4:  LAUNCH_BWD(4);  break;
+        case 8:  LAUNCH_BWD(8);  break;
+        case 16: LAUNCH_BWD(16); break;
+        case 32: LAUNCH_BWD(32); break;
+        default:
+            fprintf(stderr, "ERROR: unsupported bwd_chunk_size=%d (must be 4, 8, 16, or 32)\n", chunk_size);
+            return;
+    }
+    #undef LAUNCH_BWD
 
     int reduce_threads = min(n_heads, 256);
     int reduce_blocks = (n_heads + reduce_threads - 1) / reduce_threads;
