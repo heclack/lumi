@@ -33,7 +33,7 @@ Use `--cpu` (global flag, before subcommand) to force CPU instead of Metal GPU.
 Native training checkpoints must be converted to safetensors first:
 
 ```bash
-python3 scripts/inference/export_native_safetensors.py <checkpoint_dir> --output model.safetensors
+python3 scripts/export_native_safetensors.py <checkpoint_dir> --output model.safetensors
 ```
 
 The export script auto-transposes linear weights (`[in, out]` -> `[out, in]`) and reads block count from the checkpoint directory. Works for both 48-layer and 96-layer models.
@@ -59,7 +59,7 @@ The config JSON must match the model architecture. Example for the 96-layer Phas
   "attn_n_heads": 16,
   "attn_kv_heads": 4,
   "attn_mlp_expand": 4,
-  "dd_rope": true
+  "byte_level": false
 }
 ```
 
@@ -73,7 +73,7 @@ Set `n_layers` to match the exported model (48 for base, 96 for doubled). Set `a
 |------|-------|---------|-------------|
 | `--model` | `-m` | required | Path to safetensors weights |
 | `--config` | `-c` | required | Path to model config JSON |
-| `--tokenizer` | `-t` | required | Path to tokenizer JSON |
+| `--tokenizer` | `-t` | optional | Path to tokenizer JSON (omit for byte-level models) |
 | `--prompt` | `-p` | required | Input text |
 | `--max-tokens` | | 200 | Maximum tokens to generate |
 | `--temperature` | | 0.8 | Sampling temperature (<=0 for greedy argmax) |
@@ -84,7 +84,7 @@ Set `n_layers` to match the exported model (48 for base, 96 for doubled). Set `a
 |------|-------|---------|-------------|
 | `--model` | `-m` | required | Path to safetensors weights |
 | `--config` | `-c` | required | Path to model config JSON |
-| `--tokenizer` | `-t` | required | Path to tokenizer JSON |
+| `--tokenizer` | `-t` | optional | Path to tokenizer JSON (omit for byte-level models) |
 | `--val-data` | | `data/val.bin` | Validation data for perplexity |
 | `--data-dir` | | `data` | Directory with benchmark `.txt` files (ARC-Easy, BoolQ, WinoGrande) |
 
@@ -115,6 +115,6 @@ Falls back to CPU (Candle ops) if Metal is unavailable.
 
 ## Weight Compatibility
 
-Loads safetensors exported via `scripts/inference/export_native_safetensors.py`. Handles missing parameters gracefully:
+Loads safetensors exported via `scripts/export_native_safetensors.py`. Handles missing parameters gracefully:
 - `b_bias` / `c_bias`: defaults to ones (backward compat with older checkpoints)
 - `h_init`: defaults to zeros

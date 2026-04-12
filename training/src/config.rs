@@ -45,10 +45,6 @@ pub struct ModelConfig {
     /// Explicit attention layer indices (0-indexed). Overrides attention_interval if non-empty.
     #[serde(default)]
     pub attention_layers: Vec<usize>,
-    /// Enable data-dependent RoPE on SSM state dimensions (Mamba-3 complex SSM).
-    /// Learned rotation frequencies per head per state-pair. theta=0 init = no rotation.
-    #[serde(default = "default_dd_rope")]
-    pub dd_rope: bool,
     /// Use byte-level tokenization (vocab_size forced to 259: pad/bos/eos + 256 bytes).
     /// When true, no BPE tokenizer is needed — raw UTF-8 bytes are used directly.
     #[serde(default)]
@@ -58,7 +54,6 @@ pub struct ModelConfig {
 fn default_attn_n_heads() -> usize { 16 }
 fn default_attn_kv_heads() -> usize { 4 }
 fn default_attn_mlp_expand() -> usize { 4 }
-fn default_dd_rope() -> bool { true }
 
 impl Default for ModelConfig {
     fn default() -> Self {
@@ -80,7 +75,6 @@ impl Default for ModelConfig {
             attn_mlp_expand: 4,
             attn_window_sizes: vec![],
             attention_layers: vec![],
-            dd_rope: true,
             byte_level: false,
         }
     }
@@ -152,7 +146,7 @@ impl ModelConfig {
         let mlp_dim = self.attn_mlp_dim();
 
         // Mamba block params
-        let theta_size = if self.dd_rope { self.n_heads * self.d_state / 2 } else { 0 };
+        let theta_size = self.n_heads * self.d_state / 2; // DD-RoPE always on
         // in_proj: x(d_inner) + z(d_inner) + B(n_groups*d_state) + C(n_groups*d_state) + dt(n_heads) + lambda(n_heads) + dd_A(n_heads) + theta(optional)
         let in_proj = self.d_model * (d_inner + d_inner + self.n_groups * self.d_state * 2 + self.n_heads + self.n_heads + self.n_heads + theta_size);
         let out_proj = d_inner * self.d_model;

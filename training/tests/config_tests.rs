@@ -140,23 +140,21 @@ fn model_config_hybrid_layers() {
 
 #[test]
 fn param_count_pure_mamba() {
-    let mut config = ModelConfig::default();
-    config.dd_rope = false; // test without rope for simpler counting
+    let config = ModelConfig::default();
     let params = config.param_count();
-    // ~388M for default pure Mamba config
-    assert!(params > 350_000_000 && params < 430_000_000,
-        "Expected ~388M params, got {}", params);
+    // ~495M for default pure Mamba config (DD-RoPE always on adds ~100M theta params)
+    assert!(params > 450_000_000 && params < 550_000_000,
+        "Expected ~495M params, got {}", params);
 }
 
 #[test]
 fn param_count_hybrid() {
     let mut config = ModelConfig::default();
     config.attention_interval = 8;
-    config.dd_rope = false;
     let params = config.param_count();
-    // ~441M for hybrid (6 attention blocks add ~75M params)
-    assert!(params > 400_000_000 && params < 510_000_000,
-        "Expected ~441M params, got {}", params);
+    // ~529M for hybrid (6 attention blocks replace 6 Mamba blocks, net ~33M more)
+    assert!(params > 480_000_000 && params < 580_000_000,
+        "Expected ~529M params, got {}", params);
 }
 
 #[test]
@@ -195,45 +193,6 @@ fn attn_window_sizes_deserialize_missing() {
     }"#;
     let config: TrainingConfig = serde_json::from_str(json).unwrap();
     assert!(config.model.attn_window_sizes.is_empty());
-}
-
-#[test]
-fn dd_rope_default_true() {
-    let config = ModelConfig::default();
-    assert!(config.dd_rope);
-}
-
-#[test]
-fn dd_rope_deserialize_missing_defaults_to_true() {
-    // When dd_rope is missing from JSON, serde default gives true (DD-RoPE always enabled)
-    let json = r#"{
-        "model": {
-            "d_model": 256, "n_layers": 4, "d_state": 16, "d_conv": 4,
-            "expand": 2, "n_heads": 8, "n_groups": 2, "chunk_size": 64,
-            "vocab_size": 1000, "max_seq_len": 128, "norm_eps": 1e-5
-        },
-        "learning_rate": 1e-3, "min_lr": 1e-4,
-        "warmup_steps": 100, "max_steps": 1000,
-        "batch_size": 4, "gradient_accumulation": 1,
-        "weight_decay": 0.1, "checkpoint_interval": 500,
-        "eval_interval": 200, "sample_interval": 500, "seed": 42
-    }"#;
-    let config: TrainingConfig = serde_json::from_str(json).unwrap();
-    // serde(default = "default_dd_rope") gives true — DD-RoPE always enabled
-    assert!(config.model.dd_rope);
-}
-
-#[test]
-fn dd_rope_increases_param_count() {
-    let mut config = ModelConfig::default();
-    config.dd_rope = false;
-    let params_without = config.param_count();
-    config.dd_rope = true;
-    let params_with = config.param_count();
-    // DD-RoPE adds n_heads * d_state/2 = 2048 extra in_proj columns per Mamba layer
-    // Each column has d_model=1024 params, times 48 layers
-    let expected_increase = 1024 * 2048 * 48;
-    assert_eq!(params_with - params_without, expected_increase);
 }
 
 #[test]

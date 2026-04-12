@@ -1243,7 +1243,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 /// Smoke test: allocate small buffers, run one forward pass, check each kernel.
 #[cfg(feature = "cuda")]
 pub fn smoke_test_forward(config: &TrainingConfig) {
-    use crate::gpu_memory::{GpuBuf, TrainingBuffers};
+    use crate::gpu_memory::GpuBuf;
     use crate::native_ops;
 
     let batch: usize = 2;
@@ -1254,7 +1254,6 @@ pub fn smoke_test_forward(config: &TrainingConfig) {
     let d_state = config.model.d_state;
     let n_groups = config.model.n_groups;
     let head_dim = d_inner / n_heads;
-    let bc_size = n_groups * d_state;
     let bs = batch * seq;
 
     eprintln!("=== CUDA Smoke Test — batch={}, seq={} ===", batch, seq);
@@ -1368,6 +1367,195 @@ pub fn smoke_test_forward(config: &TrainingConfig) {
 
     unsafe { native_ops::cublas_destroy(); }
     eprintln!("\n=== Smoke test complete ===");
+}
+
+/// Extended smoke test: full forward pass for every config branch.
+/// Tests pure Mamba, hybrid (interval + explicit), windowed attention,
+/// and byte-level vocab — all with small dimensions on GPU.
+#[cfg(feature = "cuda")]
+pub fn smoke_test_configs() {
+    use crate::config::{ModelConfig, TrainingConfig};
+    use crate::gpu_memory::{GpuBuf, LayerType};
+    use crate::native_ops;
+
+    let batch: usize = 2;
+    let seq: usize = 32;
+
+    // Base small config shared by all variants
+    let base = ModelConfig {
+        d_model: 128,
+        n_layers: 8,
+        d_state: 16,
+        d_conv: 4,
+        expand: 2,
+        n_heads: 8,
+        n_groups: 2,
+        chunk_size: 64,
+        vocab_size: 1000,
+        max_seq_len: 64,
+        norm_eps: 1e-5,
+        attention_interval: 0,
+        attn_n_heads: 4,
+        attn_kv_heads: 2,
+        attn_mlp_expand: 4,
+        attn_window_sizes: vec![],
+        attention_layers: vec![],
+        byte_level: false,
+    };
+
+    let configs: Vec<(&str, ModelConfig)> = vec![
+        ("pure_mamba", base.clone()),
+        ("hybrid_interval", ModelConfig { attention_interval: 4, ..base.clone() }),
+        ("hybrid_explicit", ModelConfig { attention_layers: vec![2, 6], ..base.clone() }),
+        ("windowed_attention", ModelConfig {
+            attention_interval: 4,
+            attn_window_sizes: vec![16, 16],
+            ..base.clone()
+        }),
+        ("byte_level", ModelConfig { byte_level: true, vocab_size: 259, ..base.clone() }),
+    ];
+
+    eprintln!("=== Extended CUDA Smoke Test — {} config variants ===\n", configs.len());
+    unsafe { native_ops::cublas_init(); }
+
+    let mut pass_count = 0;
+    let mut fail_count = 0;
+
+    for (name, model_config) in &configs {
+        let training_config = TrainingConfig {
+            model: model_config.clone(),
+            batch_size: batch,
+            max_steps: 1,
+            ..TrainingConfig::default()
+        };
+
+        let d_model = model_config.d_model;
+        let d_inner = model_config.d_inner();
+        let n_heads = model_config.n_heads;
+        let n_groups = model_config.n_groups;
+        let d_state = model_config.d_state;
+        let n_layers = model_config.n_layers;
+        let vocab = model_config.vocab_size;
+        let head_dim = d_inner / n_heads;
+        let bc_size = n_groups * d_state;
+        let theta_proj = n_heads * d_state / 2;
+        let in_proj_out = d_inner + d_inner + bc_size * 2 + n_heads * 3 + theta_proj;
+        let bs = batch * seq;
+        let eps = model_config.norm_eps as f32;
+
+        eprint!("  {:24} (mamba={}, attn={}, vocab={}) ... ",
+            name, model_config.n_mamba_layers(), model_config.n_attn_layers(), vocab);
+
+        // Allocate and init
+        let mut buf = TrainingBuffers::allocate(&model_config, batch, seq);
+        init_weights_random(&mut buf, &training_config);
+
+        // Create fake input/target data (token IDs in valid range)
+        let input_data: Vec<i32> = (0..bs).map(|i| (i % vocab) as i32).collect();
+        let target_data: Vec<i32> = (0..bs).map(|i| ((i + 1) % vocab) as i32).collect();
+        let input_buf = GpuBuf::from_host(unsafe {
+            std::slice::from_raw_parts(input_data.as_ptr() as *const f32, bs)
+        });
+        let target_buf = GpuBuf::from_host(unsafe {
+            std::slice::from_raw_parts(target_data.as_ptr() as *const f32, bs)
+        });
+        buf.input_ids = input_buf;
+        buf.target_ids = target_buf;
+
+        // ──── FORWARD PASS ────
+        // 1. Embedding lookup
+        unsafe {
+            native_ops::embedding_lookup(
+                buf.embedding.ptr, buf.input_ids.ptr as *const i32,
+                buf.x.ptr, bs as i32, d_model as i32,
+            );
+        }
+
+        // 2. Layer loop (mirrors validation forward pass)
+        for layer in 0..n_layers {
+            match buf.layer_types[layer] {
+                LayerType::Mamba(midx) => {
+                    let dst = MambaForwardDst {
+                        residual: buf.residual.ptr,
+                        x_norm: buf.x_norm.ptr,
+                        x_ssm_raw: buf.x_act.ptr,
+                        x_act: buf.x_act.ptr,
+                        z_buf: buf.z_buf.ptr,
+                        b_raw: buf.b_raw.ptr,
+                        c_raw: buf.c_raw.ptr,
+                        b_norm: buf.b_norm_buf.ptr,
+                        c_norm: buf.c_norm_buf.ptr,
+                        dt_buf: buf.dt_buf.ptr,
+                        lambda_raw: buf.lambda_raw.ptr,
+                        dd_a_raw: buf.a_vals_buf.ptr,
+                        theta_raw: buf.x_ssm_raw.ptr,
+                        ssm_out: buf.ssm_out.ptr,
+                        y_gated: buf.y_gated.ptr,
+                    };
+                    unsafe {
+                        mamba_block_forward(
+                            buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr,
+                            buf.a_vals_buf.ptr, buf.block_out.ptr,
+                            &dst, &buf.layers[midx],
+                            bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
+                            n_heads as i32, n_groups as i32, d_state as i32,
+                            bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
+                        );
+                    }
+                }
+                LayerType::Attention(aidx) => {
+                    let ws = model_config.attn_window_size(aidx) as i32;
+                    unsafe {
+                        attention_block_forward(
+                            buf.x.ptr, &buf, &buf.attn_layers[aidx], None,
+                            bs as i32, d_model as i32, batch as i32, seq as i32,
+                            model_config.attn_n_heads as i32, model_config.attn_kv_heads as i32,
+                            model_config.attn_head_dim() as i32, model_config.attn_kv_dim() as i32,
+                            model_config.attn_mlp_dim() as i32, ws, eps,
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Final norm → logits → loss
+        unsafe {
+            native_ops::rmsnorm_fwd(
+                buf.x.ptr, buf.x_norm.ptr,
+                buf.final_norm_gamma.ptr, eps, bs as i32, d_model as i32,
+            );
+            native_ops::matmul_f32_bt(
+                buf.x_norm.ptr, buf.embedding.ptr, buf.logits.ptr,
+                bs as i32, vocab as i32, d_model as i32,
+            );
+            native_ops::sparse_cross_entropy_fwd(
+                buf.logits.ptr, buf.target_ids.ptr as *const i32,
+                buf.loss.ptr, buf.per_token_loss.ptr, bs as i32, vocab as i32,
+            );
+            native_ops::cudaDeviceSynchronize();
+        }
+
+        // 4. Check results
+        let per_token_loss = buf.per_token_loss.to_host();
+        let loss = per_token_loss.iter().sum::<f32>() / per_token_loss.len() as f32;
+        let has_nan = per_token_loss.iter().any(|v| v.is_nan());
+        let has_inf = per_token_loss.iter().any(|v| v.is_infinite());
+
+        if has_nan || has_inf {
+            eprintln!("FAIL (loss={:.4}, nan={}, inf={})", loss, has_nan, has_inf);
+            fail_count += 1;
+        } else {
+            eprintln!("PASS (loss={:.4})", loss);
+            pass_count += 1;
+        }
+    }
+
+    unsafe { native_ops::cublas_destroy(); }
+    eprintln!("\n=== Config smoke test: {}/{} passed ===",
+        pass_count, pass_count + fail_count);
+    if fail_count > 0 {
+        eprintln!("WARNING: {} config(s) FAILED!", fail_count);
+    }
 }
 
 /// Initialize weights for training from scratch.

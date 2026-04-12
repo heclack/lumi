@@ -16,7 +16,7 @@ use std::io::Write;
 fn compute_in_proj_out(config: &ModelConfig) -> usize {
     let d_inner = config.d_inner();
     let bc_size = config.n_groups * config.d_state;
-    let theta_proj_size = if config.dd_rope { config.n_heads * config.d_state / 2 } else { 0 };
+    let theta_proj_size = config.n_heads * config.d_state / 2; // DD-RoPE always on
     // x + z + B + C + dt + lambda + dd_A + theta
     d_inner + d_inner + bc_size * 2 + config.n_heads + config.n_heads + config.n_heads + theta_proj_size
 }
@@ -31,21 +31,11 @@ fn in_proj_out_default_config() {
 }
 
 #[test]
-fn in_proj_out_no_rope() {
-    let mut config = ModelConfig::default();
-    config.dd_rope = false;
-    let in_proj_out = compute_in_proj_out(&config);
-    // Same minus theta: 7360 - 2048 = 5312
-    assert_eq!(in_proj_out, 5312, "in_proj_out mismatch without DD-RoPE");
-}
-
-#[test]
 fn in_proj_out_small_config() {
     let config = ModelConfig {
         d_model: 128, n_layers: 4, d_state: 16, d_conv: 4,
         expand: 2, n_heads: 8, n_groups: 2, chunk_size: 64,
         vocab_size: 1000, max_seq_len: 128, norm_eps: 1e-5,
-        dd_rope: true,
         ..ModelConfig::default()
     };
     let d_inner = 256;
@@ -64,7 +54,7 @@ fn in_proj_out_matches_param_count_assumption() {
     // param_count computes in_proj as d_model * (d_inner + d_inner + n_groups*d_state*2 + n_heads*3 + theta)
     // which should equal d_model * in_proj_out
     let d_inner = config.d_inner();
-    let theta_size = if config.dd_rope { config.n_heads * config.d_state / 2 } else { 0 };
+    let theta_size = config.n_heads * config.d_state / 2; // DD-RoPE always on
     let param_count_in_proj_cols = d_inner + d_inner
         + config.n_groups * config.d_state * 2
         + config.n_heads + config.n_heads + config.n_heads
@@ -97,13 +87,11 @@ fn head_dim_divides_evenly_small() {
 }
 
 #[test]
-fn d_state_even_when_rope_enabled() {
+fn d_state_even_for_rope() {
     // DD-RoPE needs d_state/2 pairs — d_state must be even
     let config = ModelConfig::default();
-    if config.dd_rope {
-        assert_eq!(config.d_state % 2, 0,
-            "d_state must be even when dd_rope is enabled");
-    }
+    assert_eq!(config.d_state % 2, 0,
+        "d_state must be even (DD-RoPE always on)");
 }
 
 #[test]
@@ -222,7 +210,6 @@ fn config_round_trip_preserves_in_proj_dimensions() {
     assert_eq!(config.model.head_dim(), loaded.model.head_dim());
     assert_eq!(config.model.n_mamba_layers(), loaded.model.n_mamba_layers());
     assert_eq!(config.model.n_attn_layers(), loaded.model.n_attn_layers());
-    assert_eq!(config.model.dd_rope, loaded.model.dd_rope);
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,9 @@ enum Command {
         /// Config JSON path (optional).
         #[arg(short, long)]
         config: Option<String>,
+        /// Run full forward pass for all config variants (pure Mamba, hybrid, byte-level, etc.).
+        #[arg(long)]
+        all_configs: bool,
     },
 }
 
@@ -90,19 +93,24 @@ fn main() {
                 config.model.param_count() / 1_000_000);
             lumi::native_trainer::train_native(&config, device);
         }
-        Command::SmokeTest { config: config_path } => {
+        Command::SmokeTest { config: config_path, all_configs } => {
             #[cfg(feature = "cuda")]
             {
-                let config = match config_path {
-                    Some(path) => lumi::config::TrainingConfig::from_file(&path)
-                        .expect("failed to load config"),
-                    None => lumi::config::TrainingConfig::default(),
-                };
-                lumi::native_trainer::smoke_test_forward(&config);
+                if all_configs {
+                    lumi::native_trainer::smoke_test_configs();
+                } else {
+                    let config = match config_path {
+                        Some(path) => lumi::config::TrainingConfig::from_file(&path)
+                            .expect("failed to load config"),
+                        None => lumi::config::TrainingConfig::default(),
+                    };
+                    lumi::native_trainer::smoke_test_forward(&config);
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = config_path;
+                let _ = all_configs;
                 eprintln!("smoke-test requires --features cuda");
             }
         }
