@@ -444,7 +444,8 @@ impl TrainingBuffers {
         let d_state = config.d_state;
         let bc_size = n_groups * d_state;
         let theta_proj = n_heads * d_state / 2; // DD-RoPE always enabled
-        let in_proj_out = d_inner + d_inner + bc_size * 2 + n_heads + n_heads + n_heads + theta_proj; // +n_heads for dd_A
+        // in_proj splits: x(d_inner) + z(d_inner) + B(bc) + C(bc) + dt(heads) + λ(heads) + dd_A(heads) + θ(theta_proj)
+        let in_proj_out = d_inner + d_inner + bc_size * 2 + n_heads * 3 + theta_proj;
         let vocab = config.vocab_size;
         let n_layers = config.n_layers;
 
@@ -508,7 +509,7 @@ impl TrainingBuffers {
         let ws_d_dtb_buf = GpuBuf::alloc(batch * n_heads);
 
         // SSM forward→backward checkpoints (reused across layers)
-        let n_threads = 256;
+        let n_threads = 256; // CUDA block size for SSM kernels (must match ssm_scan.cu)
         let state_size = (d_model * config.expand / config.n_heads) * config.d_state;
         let max_elems = (state_size + n_threads - 1) / n_threads;
         let bwd_chunk = config.bwd_chunk_size;
