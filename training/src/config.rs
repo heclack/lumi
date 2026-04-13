@@ -260,9 +260,9 @@ impl TrainingConfig {
                 }
             }
             _ => {
-                // Cosine decay with floor (original)
-                let progress = (step - self.warmup_steps) as f64
-                    / (self.max_steps - self.warmup_steps).max(1) as f64;
+                // Cosine decay with floor
+                let progress = (step.saturating_sub(warmup_end)) as f64
+                    / (self.max_steps.saturating_sub(warmup_end)).max(1) as f64;
                 let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
                 self.min_lr + (self.learning_rate - self.min_lr) * cosine
             }
