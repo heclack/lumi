@@ -1,6 +1,6 @@
-# Lumi Model
+# Lil mamba 3 (lumi)
 
-Heavily based on both existing and described Mamba-3 architecture.
+Heavily based on both existing and described Mamba-3 architecture - built to train on a100 with local Mac inference.
 
 This is a work in progress, this project was originally created to accomplish 2 goals:
 - Training can be run on a reasonably priced GPU for an individual (RunPod with the $1.39/hr A100)
