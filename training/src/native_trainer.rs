@@ -20,6 +20,69 @@ fn chrono_timestamp() -> String {
     format!("{}", secs)
 }
 
+/// Mixed-precision dispatch macros. When `mp` is true, uses BF16 tensor-core matmuls
+/// (FP32 inputs → BF16 scratch → cublasGemmEx → FP32 output). When false, uses FP32 TF32.
+#[cfg(feature = "cuda")]
+macro_rules! mm {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k)
+        } else {
+            native_ops::matmul_f32($A, $B, $C, $m, $n, $k)
+        }
+    };
+}
+#[cfg(feature = "cuda")]
+macro_rules! mm_bt {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32_bt($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k)
+        } else {
+            native_ops::matmul_f32_bt($A, $B, $C, $m, $n, $k)
+        }
+    };
+}
+#[cfg(feature = "cuda")]
+macro_rules! mm_at_accum {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32_at_accum($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k)
+        } else {
+            native_ops::matmul_f32_at_accum($A, $B, $C, $m, $n, $k)
+        }
+    };
+}
+#[cfg(feature = "cuda")]
+macro_rules! mm_batched {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32_batched($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k, $batch)
+        } else {
+            native_ops::matmul_f32_batched($A, $B, $C, $m, $n, $k, $batch)
+        }
+    };
+}
+#[cfg(feature = "cuda")]
+macro_rules! mm_bt_batched {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32_bt_batched($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k, $batch)
+        } else {
+            native_ops::matmul_f32_bt_batched($A, $B, $C, $m, $n, $k, $batch)
+        }
+    };
+}
+#[cfg(feature = "cuda")]
+macro_rules! mm_at_batched {
+    ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
+        if $mp {
+            native_ops::matmul_bf16_from_f32_at_batched($A, $B, $C, $buf.bf16_scratch_a.ptr, $buf.bf16_scratch_b.ptr, $m, $n, $k, $batch)
+        } else {
+            native_ops::matmul_f32_at_batched($A, $B, $C, $m, $n, $k, $batch)
+        }
+    };
+}
+
 /// Destination pointers for Mamba block intermediate values.
 /// Training points these to per-layer saved buffers; validation points to scratch.
 #[cfg(feature = "cuda")]
@@ -52,6 +115,7 @@ unsafe fn attention_block_forward(
     bs: i32, d_model: i32, batch: i32, seq: i32,
     attn_n_heads: i32, attn_kv_heads: i32, attn_head_dim: i32,
     kv_dim: i32, mlp_dim: i32, window_size: i32, eps: f32,
+    mp: bool,
 ) {
     let bnh = batch * attn_n_heads;
     let scale = 1.0f32 / (attn_head_dim as f32).sqrt();
@@ -65,9 +129,9 @@ unsafe fn attention_block_forward(
     if let Some(s) = save { cuda_memcpy_d2d(s.x_norm.ptr, buf.x_norm.ptr, (bs * d_model) as usize); }
 
     // Q/K/V projections
-    native_ops::matmul_f32(buf.x_norm.ptr, weights.q_proj.ptr, buf.attn_q.ptr, bs, d_model, d_model);
-    native_ops::matmul_f32(buf.x_norm.ptr, weights.k_proj.ptr, buf.attn_k.ptr, bs, kv_dim, d_model);
-    native_ops::matmul_f32(buf.x_norm.ptr, weights.v_proj.ptr, buf.attn_v.ptr, bs, kv_dim, d_model);
+    mm!(mp, buf, buf.x_norm.ptr, weights.q_proj.ptr, buf.attn_q.ptr, bs, d_model, d_model);
+    mm!(mp, buf, buf.x_norm.ptr, weights.k_proj.ptr, buf.attn_k.ptr, bs, kv_dim, d_model);
+    mm!(mp, buf, buf.x_norm.ptr, weights.v_proj.ptr, buf.attn_v.ptr, bs, kv_dim, d_model);
 
     if let Some(s) = save {
         cuda_memcpy_d2d(s.q.ptr, buf.attn_q.ptr, (bs * d_model) as usize);
@@ -83,17 +147,17 @@ unsafe fn attention_block_forward(
     native_ops::gqa_expand(buf.attn_kv_temp.ptr, buf.attn_v_t.ptr, batch, attn_kv_heads, attn_n_heads, seq, attn_head_dim);
 
     // Attention: scores → softmax → context
-    native_ops::matmul_f32_bt_batched(buf.attn_q_t.ptr, buf.attn_k_t.ptr, buf.attn_scores.ptr,
+    mm_bt_batched!(mp, buf, buf.attn_q_t.ptr, buf.attn_k_t.ptr, buf.attn_scores.ptr,
         seq, seq, attn_head_dim, bnh);
     native_ops::scale_tensor(buf.attn_scores.ptr, buf.attn_scores.ptr,
         scale, batch * attn_n_heads * seq * seq);
     native_ops::causal_softmax_fwd(buf.attn_scores.ptr, buf.attn_weights.ptr, bnh, seq, window_size);
-    native_ops::matmul_f32_batched(buf.attn_weights.ptr, buf.attn_v_t.ptr, buf.attn_context_t.ptr,
+    mm_batched!(mp, buf, buf.attn_weights.ptr, buf.attn_v_t.ptr, buf.attn_context_t.ptr,
         seq, attn_head_dim, seq, bnh);
     native_ops::transpose_0213(buf.attn_context_t.ptr, buf.attn_context.ptr, batch, attn_n_heads, seq, attn_head_dim);
 
     // Output projection + residual
-    native_ops::matmul_f32(buf.attn_context.ptr, weights.attn_out_proj.ptr, buf.block_out.ptr, bs, d_model, d_model);
+    mm!(mp, buf, buf.attn_context.ptr, weights.attn_out_proj.ptr, buf.block_out.ptr, bs, d_model, d_model);
     native_ops::elemwise_add(buf.block_out.ptr, residual, x, bs * d_model);
 
     if let Some(s) = save {
@@ -110,8 +174,8 @@ unsafe fn attention_block_forward(
     if let Some(s) = save { cuda_memcpy_d2d(s.mlp_norm_out.ptr, buf.x_norm.ptr, (bs * d_model) as usize); }
 
     // MLP gate + up projections
-    native_ops::matmul_f32(buf.x_norm.ptr, weights.mlp_gate.ptr, buf.attn_mlp_hidden.ptr, bs, mlp_dim, d_model);
-    native_ops::matmul_f32(buf.x_norm.ptr, weights.mlp_up.ptr, buf.attn_mlp_gated.ptr, bs, mlp_dim, d_model);
+    mm!(mp, buf, buf.x_norm.ptr, weights.mlp_gate.ptr, buf.attn_mlp_hidden.ptr, bs, mlp_dim, d_model);
+    mm!(mp, buf, buf.x_norm.ptr, weights.mlp_up.ptr, buf.attn_mlp_gated.ptr, bs, mlp_dim, d_model);
 
     if let Some(s) = save {
         cuda_memcpy_d2d(s.gate_raw.ptr, buf.attn_mlp_hidden.ptr, (bs * mlp_dim) as usize);
@@ -125,7 +189,7 @@ unsafe fn attention_block_forward(
     if let Some(s) = save { cuda_memcpy_d2d(s.y_gated.ptr, buf.attn_mlp_gated.ptr, (bs * mlp_dim) as usize); }
 
     // MLP down + residual
-    native_ops::matmul_f32(buf.attn_mlp_gated.ptr, weights.mlp_down.ptr, buf.block_out.ptr, bs, d_model, mlp_dim);
+    mm!(mp, buf, buf.attn_mlp_gated.ptr, weights.mlp_down.ptr, buf.block_out.ptr, bs, d_model, mlp_dim);
     native_ops::elemwise_add(buf.block_out.ptr, mlp_residual, x, bs * d_model);
 }
 
@@ -139,10 +203,12 @@ unsafe fn mamba_block_forward(
     block_out: *mut f32,
     dst: &MambaForwardDst,
     weights: &LayerWeights,
+    buf: &TrainingBuffers,
     bs: i32, d_model: i32, d_inner: i32, in_proj_out: i32,
     n_heads: i32, n_groups: i32, d_state: i32,
     bc_size: i32, batch: i32, seq: i32, head_dim: i32,
     eps: f32,
+    mp: bool,
 ) {
     // Save residual
     cuda_memcpy_d2d(dst.residual, x, (bs * d_model) as usize);
@@ -151,7 +217,7 @@ unsafe fn mamba_block_forward(
     native_ops::rmsnorm_fwd(x, dst.x_norm, weights.norm_gamma.ptr, eps, bs, d_model);
 
     // in_proj
-    native_ops::matmul_f32(dst.x_norm, weights.in_proj.ptr, projected, bs, in_proj_out, d_model);
+    mm!(mp, buf, dst.x_norm, weights.in_proj.ptr, projected, bs, in_proj_out, d_model);
 
     // Fused 5-way split
     native_ops::fused_split_5(
@@ -193,7 +259,7 @@ unsafe fn mamba_block_forward(
     );
 
     // out_proj
-    native_ops::matmul_f32(dst.y_gated, weights.out_proj.ptr, block_out, bs, d_model, d_inner);
+    mm!(mp, buf, dst.y_gated, weights.out_proj.ptr, block_out, bs, d_model, d_inner);
 
     // Residual add
     native_ops::elemwise_add(block_out, dst.residual, x, bs * d_model);
@@ -248,7 +314,10 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
     let wd = config.weight_decay as f32;
 
     // Allocate all GPU buffers
-    let mut buf = TrainingBuffers::allocate(&config.model, batch, seq);
+    let mut buf = TrainingBuffers::allocate(
+        &config.model, batch, seq, config.mixed_precision, config.bf16_activations,
+    );
+    let mp = config.mixed_precision;
 
     // Initialize weights: try to resume from checkpoint, else random init
     let mut resumed_epoch: usize = 0;
@@ -392,36 +461,74 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                         bs as i32, d_model as i32, batch as i32, seq as i32,
                         attn_n_heads_i, attn_kv_heads_i, attn_head_dim_i,
                         kv_dim as i32, mlp_dim as i32, ws, eps,
+                        mp,
                     );
                 }
             }
 
             LayerType::Mamba(idx) => {
-            let dst = MambaForwardDst {
-                residual: buf.saved[idx].residual.ptr,
-                x_norm: buf.saved[idx].x_norm.ptr,
-                x_ssm_raw: buf.saved[idx].x_ssm_raw.ptr,
-                x_act: buf.saved[idx].x_act.ptr,
-                z_buf: buf.saved[idx].z_buf.ptr,
-                b_raw: buf.saved[idx].b_raw.ptr,
-                c_raw: buf.saved[idx].c_raw.ptr,
-                b_norm: buf.saved[idx].b_norm.ptr,
-                c_norm: buf.saved[idx].c_norm.ptr,
-                dt_buf: buf.saved[idx].dt_buf.ptr,
-                lambda_raw: buf.saved[idx].lambda_raw.ptr,
-                dd_a_raw: buf.saved[idx].dd_a_raw.ptr,
-                theta_raw: buf.saved[idx].theta_raw.ptr,
-                ssm_out: buf.saved[idx].ssm_out.ptr,
-                y_gated: buf.saved[idx].y_gated.ptr,
-            };
-            unsafe {
-                mamba_block_forward(
-                    buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr, buf.a_vals_buf.ptr, buf.block_out.ptr,
-                    &dst, &buf.layers[idx],
-                    bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
-                    n_heads as i32, n_groups as i32, d_state as i32,
-                    bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
-                );
+            if buf.bf16_activations {
+                // BF16 save path: forward writes into shared FP32 scratch, then we
+                // down-convert each live saved tensor into per-layer BF16 storage.
+                let dst = MambaForwardDst {
+                    residual: buf.residual.ptr,
+                    x_norm: buf.x_norm.ptr,
+                    x_ssm_raw: buf.x_ssm_raw.ptr,
+                    x_act: buf.x_act.ptr,
+                    z_buf: buf.z_buf.ptr,
+                    b_raw: buf.b_raw.ptr,
+                    c_raw: buf.c_raw.ptr,
+                    b_norm: buf.b_norm_buf.ptr,
+                    c_norm: buf.c_norm_buf.ptr,
+                    dt_buf: buf.dt_buf.ptr,
+                    lambda_raw: buf.lambda_raw.ptr,
+                    dd_a_raw: buf.dd_a_raw.ptr,
+                    theta_raw: buf.theta_raw.ptr,
+                    ssm_out: buf.ssm_out.ptr,
+                    y_gated: buf.y_gated.ptr,
+                };
+                unsafe {
+                    mamba_block_forward(
+                        buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr, buf.a_vals_buf.ptr, buf.block_out.ptr,
+                        &dst, &buf.layers[idx], &buf,
+                        bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
+                        n_heads as i32, n_groups as i32, d_state as i32,
+                        bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
+                        mp,
+                    );
+                    save_mamba_layer_bf16(
+                        &buf, &buf.saved_bf16[idx],
+                        bs, d_model, d_inner, bc_size, n_heads, theta_proj_size,
+                    );
+                }
+            } else {
+                let dst = MambaForwardDst {
+                    residual: buf.saved[idx].residual.ptr,
+                    x_norm: buf.saved[idx].x_norm.ptr,
+                    x_ssm_raw: buf.saved[idx].x_ssm_raw.ptr,
+                    x_act: buf.saved[idx].x_act.ptr,
+                    z_buf: buf.saved[idx].z_buf.ptr,
+                    b_raw: buf.saved[idx].b_raw.ptr,
+                    c_raw: buf.saved[idx].c_raw.ptr,
+                    b_norm: buf.saved[idx].b_norm.ptr,
+                    c_norm: buf.saved[idx].c_norm.ptr,
+                    dt_buf: buf.saved[idx].dt_buf.ptr,
+                    lambda_raw: buf.saved[idx].lambda_raw.ptr,
+                    dd_a_raw: buf.saved[idx].dd_a_raw.ptr,
+                    theta_raw: buf.saved[idx].theta_raw.ptr,
+                    ssm_out: buf.saved[idx].ssm_out.ptr,
+                    y_gated: buf.saved[idx].y_gated.ptr,
+                };
+                unsafe {
+                    mamba_block_forward(
+                        buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr, buf.a_vals_buf.ptr, buf.block_out.ptr,
+                        &dst, &buf.layers[idx], &buf,
+                        bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
+                        n_heads as i32, n_groups as i32, d_state as i32,
+                        bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
+                        mp,
+                    );
+                }
             }
             } // end LayerType::Mamba
             } // end match layer_type
@@ -515,9 +622,9 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
                 // MLP down backward: d_mlp_gated = d_x @ mlp_down^T, weight grad
                 unsafe {
-                    native_ops::matmul_f32_bt(buf.d_x.ptr, aw.mlp_down.ptr, buf.d_attn_mlp_gated.ptr,
+                    mm_bt!(mp, buf, buf.d_x.ptr, aw.mlp_down.ptr, buf.d_attn_mlp_gated.ptr,
                         bs as i32, mlp_dim as i32, d_model as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].y_gated.ptr, buf.d_x.ptr, daw.d_mlp_down,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].y_gated.ptr, buf.d_x.ptr, daw.d_mlp_down,
                         mlp_dim as i32, d_model as i32, bs as i32);
                 }
 
@@ -540,18 +647,18 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                 // MLP gate/up weight grads + d_mlp_norm
                 unsafe {
                     // d_mlp_norm from gate path
-                    native_ops::matmul_f32_bt(buf.d_attn_mlp_hidden.ptr, aw.mlp_gate.ptr, buf.d_x_norm.ptr,
+                    mm_bt!(mp, buf, buf.d_attn_mlp_hidden.ptr, aw.mlp_gate.ptr, buf.d_x_norm.ptr,
                         bs as i32, d_model as i32, mlp_dim as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].mlp_norm_out.ptr,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].mlp_norm_out.ptr,
                         buf.d_attn_mlp_hidden.ptr, daw.d_mlp_gate,
                         d_model as i32, mlp_dim as i32, bs as i32);
 
                     // d_mlp_norm += from up path
-                    native_ops::matmul_f32_bt(buf.d_attn_mlp_gated.ptr, aw.mlp_up.ptr, buf.d_block_out.ptr,
+                    mm_bt!(mp, buf, buf.d_attn_mlp_gated.ptr, aw.mlp_up.ptr, buf.d_block_out.ptr,
                         bs as i32, d_model as i32, mlp_dim as i32);
                     native_ops::elemwise_add(buf.d_x_norm.ptr, buf.d_block_out.ptr, buf.d_x_norm.ptr,
                         (bs * d_model) as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].mlp_norm_out.ptr,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].mlp_norm_out.ptr,
                         buf.d_attn_mlp_gated.ptr, daw.d_mlp_up,
                         d_model as i32, mlp_dim as i32, bs as i32);
                 }
@@ -574,9 +681,9 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
                 // Output proj backward: d_context = d_x @ out_proj^T
                 unsafe {
-                    native_ops::matmul_f32_bt(buf.d_x.ptr, aw.attn_out_proj.ptr, buf.d_attn_context.ptr,
+                    mm_bt!(mp, buf, buf.d_x.ptr, aw.attn_out_proj.ptr, buf.d_attn_context.ptr,
                         bs as i32, d_model as i32, d_model as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].context.ptr, buf.d_x.ptr, daw.d_attn_out_proj,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].context.ptr, buf.d_x.ptr, daw.d_attn_out_proj,
                         d_model as i32, d_model as i32, bs as i32);
                 }
 
@@ -598,12 +705,12 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                         batch as i32, attn_kv_heads as i32, attn_n_heads as i32, seq as i32, attn_head_dim as i32);
 
                     // d_weights = d_context_t @ V_t^T
-                    native_ops::matmul_f32_bt_batched(
+                    mm_bt_batched!(mp, buf,
                         buf.d_attn_context_t.ptr, buf.attn_v_t.ptr, buf.d_attn_scores.ptr,
                         seq as i32, seq as i32, attn_head_dim as i32, bnh);
 
                     // d_V_t = weights^T @ d_context_t
-                    native_ops::matmul_f32_at_batched(
+                    mm_at_batched!(mp, buf,
                         buf.attn_saved[aidx].attn_weights.ptr, buf.d_attn_context_t.ptr, buf.d_attn_v_t.ptr,
                         seq as i32, attn_head_dim as i32, seq as i32, bnh);
                 }
@@ -635,12 +742,12 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                         batch as i32, seq as i32, attn_n_heads as i32, attn_head_dim as i32);
 
                     // d_Q_t = d_scores @ K_t
-                    native_ops::matmul_f32_batched(
+                    mm_batched!(mp, buf,
                         buf.d_attn_scores.ptr, buf.attn_k_t.ptr, buf.d_attn_q_t.ptr,
                         seq as i32, attn_head_dim as i32, seq as i32, bnh);
 
                     // d_K_t = d_scores^T @ Q_t
-                    native_ops::matmul_f32_at_batched(
+                    mm_at_batched!(mp, buf,
                         buf.d_attn_scores.ptr, buf.attn_q_t.ptr, buf.d_attn_k_t.ptr,
                         seq as i32, attn_head_dim as i32, seq as i32, bnh);
                 }
@@ -667,25 +774,25 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                 // Q/K/V projection weight grads + d_x_norm
                 unsafe {
                     // d_x_norm from Q
-                    native_ops::matmul_f32_bt(buf.d_attn_q.ptr, aw.q_proj.ptr, buf.d_x_norm.ptr,
+                    mm_bt!(mp, buf, buf.d_attn_q.ptr, aw.q_proj.ptr, buf.d_x_norm.ptr,
                         bs as i32, d_model as i32, d_model as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_q.ptr, daw.d_q_proj,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_q.ptr, daw.d_q_proj,
                         d_model as i32, d_model as i32, bs as i32);
 
                     // d_x_norm += from K
-                    native_ops::matmul_f32_bt(buf.d_attn_k.ptr, aw.k_proj.ptr, buf.d_block_out.ptr,
+                    mm_bt!(mp, buf, buf.d_attn_k.ptr, aw.k_proj.ptr, buf.d_block_out.ptr,
                         bs as i32, d_model as i32, kv_dim as i32);
                     native_ops::elemwise_add(buf.d_x_norm.ptr, buf.d_block_out.ptr, buf.d_x_norm.ptr,
                         (bs * d_model) as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_k.ptr, daw.d_k_proj,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_k.ptr, daw.d_k_proj,
                         d_model as i32, kv_dim as i32, bs as i32);
 
                     // d_x_norm += from V
-                    native_ops::matmul_f32_bt(buf.d_attn_v.ptr, aw.v_proj.ptr, buf.d_block_out.ptr,
+                    mm_bt!(mp, buf, buf.d_attn_v.ptr, aw.v_proj.ptr, buf.d_block_out.ptr,
                         bs as i32, d_model as i32, kv_dim as i32);
                     native_ops::elemwise_add(buf.d_x_norm.ptr, buf.d_block_out.ptr, buf.d_x_norm.ptr,
                         (bs * d_model) as i32);
-                    native_ops::matmul_f32_at_accum(buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_v.ptr, daw.d_v_proj,
+                    mm_at_accum!(mp, buf, buf.attn_saved[aidx].x_norm.ptr, buf.d_attn_v.ptr, daw.d_v_proj,
                         d_model as i32, kv_dim as i32, bs as i32);
                 }
 
@@ -704,6 +811,216 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
             }
 
             LayerType::Mamba(idx) => {
+            if buf.bf16_activations {
+                let saved = &buf.saved_bf16[idx];
+
+                // d_block_out = d_x
+                unsafe {
+                    cuda_memcpy_d2d(buf.d_block_out.ptr, buf.d_x.ptr, bs * d_model);
+                }
+
+                // out_proj backward: d_y_gated = d_block_out @ out_proj^T
+                unsafe {
+                    mm_bt!(mp, buf,
+                        buf.d_block_out.ptr, buf.layers[idx].out_proj.ptr, buf.d_y_gated.ptr,
+                        bs as i32, d_inner as i32, d_model as i32
+                    );
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.y_gated.ptr, bs * d_inner);
+                    mm_at_accum!(mp, buf,
+                        buf.bwd_stage_a.ptr, buf.d_block_out.ptr, buf.d_layers[idx].d_out_proj,
+                        d_inner as i32, d_model as i32, bs as i32
+                    );
+                }
+
+                // Fused gate backward: needs ssm_out and z_buf concurrently
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.ssm_out.ptr, bs * d_inner);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_b.ptr, saved.z_buf.ptr, bs * d_inner);
+                    native_ops::fused_silu_gate_bwd(
+                        buf.bwd_stage_a.ptr, buf.bwd_stage_b.ptr, buf.d_y_gated.ptr,
+                        buf.d_ssm_out.ptr, buf.d_z.ptr,
+                        (bs * d_inner) as i32,
+                    );
+                }
+
+                // Recompute lambda_buf from saved lambda_raw (sequential use of stage_a OK)
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.lambda_raw.ptr, bs * n_heads);
+                    native_ops::sigmoid_fwd(
+                        buf.bwd_stage_a.ptr, buf.lambda_buf.ptr, (bs * n_heads) as i32,
+                    );
+                }
+
+                // Recompute a_vals_buf from saved dd_a_raw
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.dd_a_raw.ptr, bs * n_heads);
+                    native_ops::neg_softplus_clamp(
+                        buf.bwd_stage_a.ptr, buf.a_vals_buf.ptr, -1e6, -1e-4, (bs * n_heads) as i32,
+                    );
+                }
+
+                // SSM backward — needs 5 saved tensors concurrently (staged a..e)
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.x_act.ptr,     bs * d_inner);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_b.ptr, saved.dt_buf.ptr,    bs * n_heads);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_c.ptr, saved.b_norm.ptr,    bs * bc_size);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_d.ptr, saved.c_norm.ptr,    bs * bc_size);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_e.ptr, saved.theta_raw.ptr, bs * theta_proj_size);
+                    native_ops::ssm_scan_bwd_gpu_v2(
+                        buf.bwd_stage_a.ptr,            // x_act
+                        buf.bwd_stage_b.ptr,            // dt
+                        buf.bwd_stage_c.ptr,            // b_norm
+                        buf.bwd_stage_d.ptr,            // c_norm
+                        buf.layers[idx].d_skip.ptr,
+                        buf.layers[idx].dt_bias.ptr,
+                        buf.d_ssm_out.ptr,
+                        buf.lambda_buf.ptr,
+                        buf.layers[idx].h_init.ptr,
+                        buf.ssm_h_checkpoints.ptr, buf.ssm_pbx_checkpoints.ptr,
+                        buf.ssm_h_saved.ptr, buf.ssm_pbx_saved.ptr,
+                        buf.bwd_stage_e.ptr,            // theta_raw
+                        buf.a_vals_buf.ptr,
+                        buf.d_x_act.ptr,
+                        buf.d_dt.ptr,
+                        buf.d_b_norm.ptr,
+                        buf.d_c_norm.ptr,
+                        buf.d_lambda.ptr,
+                        buf.d_layers[idx].d_h_init,
+                        buf.d_theta_raw.ptr,
+                        buf.d_a_vals.ptr,
+                        buf.d_layers[idx].d_d_skip,
+                        buf.d_layers[idx].d_dt_bias,
+                        buf.ws_d_d_buf.ptr, buf.ws_d_dtb_buf.ptr,
+                        batch as i32, seq as i32, n_heads as i32,
+                        head_dim as i32, d_state as i32, n_groups as i32,
+                        config.model.bwd_chunk_size as i32,
+                    );
+                }
+
+                // DD-RoPE: assemble d_theta_raw back into d_projected
+                {
+                    let theta_offset = (d_inner * 2 + bc_size * 2 + n_heads + n_heads + n_heads) as i32;
+                    let theta_size = (n_heads * d_state / 2) as i32;
+                    unsafe {
+                        native_ops::strided_assemble(
+                            buf.d_theta_raw.ptr, buf.d_projected.ptr,
+                            bs as i32, in_proj_out as i32, theta_offset, theta_size,
+                        );
+                    }
+                }
+
+                // BCNorm + bias backward (b_raw, then c_raw — sequential stage reuse)
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.b_raw.ptr, bs * bc_size);
+                    native_ops::rmsnorm_bias_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_b_norm.ptr,
+                        buf.layers[idx].b_gamma.ptr,
+                        buf.d_b_norm.ptr,
+                        buf.d_layers[idx].d_b_gamma, buf.d_layers[idx].d_b_bias,
+                        eps, bs as i32, bc_size as i32,
+                    );
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.c_raw.ptr, bs * bc_size);
+                    native_ops::rmsnorm_bias_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_c_norm.ptr,
+                        buf.layers[idx].c_gamma.ptr,
+                        buf.d_c_norm.ptr,
+                        buf.d_layers[idx].d_c_gamma, buf.d_layers[idx].d_c_bias,
+                        eps, bs as i32, bc_size as i32,
+                    );
+                }
+
+                // SiLU backward on x_ssm
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.x_ssm_raw.ptr, bs * d_inner);
+                    native_ops::silu_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_x_act.ptr, buf.d_x_act.ptr,
+                        (bs * d_inner) as i32,
+                    );
+                }
+
+                // Assemble d_projected from component gradients
+                unsafe {
+                    let mut col = 0i32;
+                    native_ops::strided_assemble(
+                        buf.d_x_act.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, d_inner as i32,
+                    );
+                    col += d_inner as i32;
+                    native_ops::strided_assemble(
+                        buf.d_z.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, d_inner as i32,
+                    );
+                    col += d_inner as i32;
+                    native_ops::strided_assemble(
+                        buf.d_b_norm.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, bc_size as i32,
+                    );
+                    col += bc_size as i32;
+                    native_ops::strided_assemble(
+                        buf.d_c_norm.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, bc_size as i32,
+                    );
+                    col += bc_size as i32;
+                    native_ops::strided_assemble(
+                        buf.d_dt.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, n_heads as i32,
+                    );
+                    col += n_heads as i32;
+                    // sigmoid backward on lambda
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.lambda_raw.ptr, bs * n_heads);
+                    native_ops::sigmoid_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_lambda.ptr, buf.d_lambda.ptr,
+                        (bs * n_heads) as i32,
+                    );
+                    native_ops::strided_assemble(
+                        buf.d_lambda.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, n_heads as i32,
+                    );
+                    col += n_heads as i32;
+                    // softplus backward on dd_A
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.dd_a_raw.ptr, bs * n_heads);
+                    native_ops::softplus_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_a_vals.ptr, buf.d_a_vals.ptr,
+                        (bs * n_heads) as i32,
+                    );
+                    native_ops::negate(buf.d_a_vals.ptr, buf.d_a_vals.ptr, (bs * n_heads) as i32);
+                    native_ops::strided_assemble(
+                        buf.d_a_vals.ptr, buf.d_projected.ptr,
+                        bs as i32, in_proj_out as i32, col, n_heads as i32,
+                    );
+                }
+
+                // in_proj backward: x_norm is needed for weight grad
+                unsafe {
+                    mm_bt!(mp, buf,
+                        buf.d_projected.ptr, buf.layers[idx].in_proj.ptr, buf.d_x_norm.ptr,
+                        bs as i32, d_model as i32, in_proj_out as i32
+                    );
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.x_norm.ptr, bs * d_model);
+                    mm_at_accum!(mp, buf,
+                        buf.bwd_stage_a.ptr, buf.d_projected.ptr, buf.d_layers[idx].d_in_proj,
+                        d_model as i32, in_proj_out as i32, bs as i32
+                    );
+                }
+
+                // RMSNorm backward: residual is needed for x grad
+                unsafe {
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.residual.ptr, bs * d_model);
+                    native_ops::rmsnorm_bwd(
+                        buf.bwd_stage_a.ptr, buf.d_x_norm.ptr,
+                        buf.layers[idx].norm_gamma.ptr,
+                        buf.d_x.ptr, buf.d_layers[idx].d_norm_gamma,
+                        eps, bs as i32, d_model as i32,
+                    );
+                }
+
+                // Add residual gradient: d_x += d_block_out
+                unsafe {
+                    native_ops::elemwise_add(
+                        buf.d_x.ptr, buf.d_block_out.ptr, buf.d_x.ptr, (bs * d_model) as i32,
+                    );
+                }
+            } else {
 
             // d_block_out = d_x
             unsafe {
@@ -712,13 +1029,13 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
             // out_proj backward: d_y_gated = d_block_out @ out_proj^T
             unsafe {
-                native_ops::matmul_f32_bt(
+                mm_bt!(mp, buf,
                     buf.d_block_out.ptr, buf.layers[idx].out_proj.ptr, buf.d_y_gated.ptr,
-                    bs as i32, d_inner as i32, d_model as i32,
+                    bs as i32, d_inner as i32, d_model as i32
                 );
-                native_ops::matmul_f32_at_accum(
+                mm_at_accum!(mp, buf,
                     buf.saved[idx].y_gated.ptr, buf.d_block_out.ptr, buf.d_layers[idx].d_out_proj,
-                    d_inner as i32, d_model as i32, bs as i32,
+                    d_inner as i32, d_model as i32, bs as i32
                 );
             }
 
@@ -866,13 +1183,13 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
             // in_proj backward: uses saved x_norm for weight grad
             unsafe {
-                native_ops::matmul_f32_bt(
+                mm_bt!(mp, buf,
                     buf.d_projected.ptr, buf.layers[idx].in_proj.ptr, buf.d_x_norm.ptr,
-                    bs as i32, d_model as i32, in_proj_out as i32,
+                    bs as i32, d_model as i32, in_proj_out as i32
                 );
-                native_ops::matmul_f32_at_accum(
+                mm_at_accum!(mp, buf,
                     buf.saved[idx].x_norm.ptr, buf.d_projected.ptr, buf.d_layers[idx].d_in_proj,
-                    d_model as i32, in_proj_out as i32, bs as i32,
+                    d_model as i32, in_proj_out as i32, bs as i32
                 );
             }
 
@@ -891,6 +1208,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                 native_ops::elemwise_add(
                     buf.d_x.ptr, buf.d_block_out.ptr, buf.d_x.ptr, (bs * d_model) as i32,
                 );
+            }
             }
             } // end LayerType::Mamba
             } // end match layer_type
@@ -1123,10 +1441,11 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                         unsafe {
                             mamba_block_forward(
                                 buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr, buf.a_vals_buf.ptr, buf.block_out.ptr,
-                                &dst, &buf.layers[midx],
+                                &dst, &buf.layers[midx], &buf,
                                 bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
                                 n_heads as i32, n_groups as i32, d_state as i32,
                                 bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
+                                mp,
                             );
                         }
                         }
@@ -1139,6 +1458,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                                 config.model.attn_n_heads as i32, config.model.attn_kv_heads as i32,
                                 config.model.attn_head_dim() as i32, config.model.attn_kv_dim() as i32,
                                 config.model.attn_mlp_dim() as i32, ws, eps,
+                                mp,
                             );
                         }
                         }
@@ -1366,6 +1686,7 @@ pub fn smoke_test_configs() {
         attn_window_sizes: vec![],
         attention_layers: vec![],
         byte_level: false,
+        bwd_chunk_size: 8,
     };
 
     let configs: Vec<(&str, ModelConfig)> = vec![
@@ -1412,7 +1733,7 @@ pub fn smoke_test_configs() {
             name, model_config.n_mamba_layers(), model_config.n_attn_layers(), vocab);
 
         // Allocate and init
-        let mut buf = TrainingBuffers::allocate(&model_config, batch, seq);
+        let mut buf = TrainingBuffers::allocate(&model_config, batch, seq, false, false);
         init_weights_random(&mut buf, &training_config);
 
         // Create fake input/target data (token IDs in valid range)
@@ -1461,10 +1782,11 @@ pub fn smoke_test_configs() {
                         mamba_block_forward(
                             buf.x.ptr, buf.projected.ptr, buf.lambda_buf.ptr,
                             buf.a_vals_buf.ptr, buf.block_out.ptr,
-                            &dst, &buf.layers[midx],
+                            &dst, &buf.layers[midx], &buf,
                             bs as i32, d_model as i32, d_inner as i32, in_proj_out as i32,
                             n_heads as i32, n_groups as i32, d_state as i32,
                             bc_size as i32, batch as i32, seq as i32, head_dim as i32, eps,
+                            false,
                         );
                     }
                 }
@@ -1477,6 +1799,7 @@ pub fn smoke_test_configs() {
                             model_config.attn_n_heads as i32, model_config.attn_kv_heads as i32,
                             model_config.attn_head_dim() as i32, model_config.attn_kv_dim() as i32,
                             model_config.attn_mlp_dim() as i32, ws, eps,
+                            false,
                         );
                     }
                 }
@@ -1730,6 +2053,42 @@ unsafe fn cuda_memcpy_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_vo
 unsafe fn cuda_memcpy_d2d(dst: *mut f32, src: *const f32, n: usize) {
     cudaMemcpy(dst as *mut std::ffi::c_void, src as *const std::ffi::c_void,
                n * 4, 3); // cudaMemcpyDeviceToDevice
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_convert_f32_to_bf16(dst: *mut u16, src: *const f32, n: usize) {
+    native_ops::convert_f32_to_bf16(src, dst, n as i32);
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_convert_bf16_to_f32(dst: *mut f32, src: *const u16, n: usize) {
+    native_ops::convert_bf16_to_f32(src, dst, n as i32);
+}
+
+/// Copy live FP32 forward scratch into BF16 per-layer storage.
+/// Only called in the bf16_activations path after a Mamba forward into shared scratch.
+#[cfg(feature = "cuda")]
+unsafe fn save_mamba_layer_bf16(
+    buf: &TrainingBuffers,
+    saved: &crate::gpu_memory::PerLayerSavedBf16,
+    bs: usize, d_model: usize, d_inner: usize,
+    bc_size: usize, n_heads: usize, theta_proj: usize,
+) {
+    cuda_convert_f32_to_bf16(saved.residual.ptr,   buf.residual.ptr,   bs * d_model);
+    cuda_convert_f32_to_bf16(saved.x_norm.ptr,     buf.x_norm.ptr,     bs * d_model);
+    cuda_convert_f32_to_bf16(saved.x_ssm_raw.ptr,  buf.x_ssm_raw.ptr,  bs * d_inner);
+    cuda_convert_f32_to_bf16(saved.x_act.ptr,      buf.x_act.ptr,      bs * d_inner);
+    cuda_convert_f32_to_bf16(saved.z_buf.ptr,      buf.z_buf.ptr,      bs * d_inner);
+    cuda_convert_f32_to_bf16(saved.b_raw.ptr,      buf.b_raw.ptr,      bs * bc_size);
+    cuda_convert_f32_to_bf16(saved.c_raw.ptr,      buf.c_raw.ptr,      bs * bc_size);
+    cuda_convert_f32_to_bf16(saved.b_norm.ptr,     buf.b_norm_buf.ptr, bs * bc_size);
+    cuda_convert_f32_to_bf16(saved.c_norm.ptr,     buf.c_norm_buf.ptr, bs * bc_size);
+    cuda_convert_f32_to_bf16(saved.dt_buf.ptr,     buf.dt_buf.ptr,     bs * n_heads);
+    cuda_convert_f32_to_bf16(saved.lambda_raw.ptr, buf.lambda_raw.ptr, bs * n_heads);
+    cuda_convert_f32_to_bf16(saved.dd_a_raw.ptr,   buf.dd_a_raw.ptr,   bs * n_heads);
+    cuda_convert_f32_to_bf16(saved.theta_raw.ptr,  buf.theta_raw.ptr,  bs * theta_proj);
+    cuda_convert_f32_to_bf16(saved.ssm_out.ptr,    buf.ssm_out.ptr,    bs * d_inner);
+    cuda_convert_f32_to_bf16(saved.y_gated.ptr,    buf.y_gated.ptr,    bs * d_inner);
 }
 
 /// Stub for non-CUDA

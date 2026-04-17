@@ -196,85 +196,85 @@ fn make_encode_fn(tokenizer: Option<&tokenizers::Tokenizer>) -> Box<dyn Fn(&str)
     }
 }
 
-pub fn load_arc_easy(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
-    load_qa_pairs(path, encode_fn, max_questions)
-}
+// Embedded benchmark snapshots — decoupled from the mutable training data corpus.
+const ARC_EASY_DATA: &str = include_str!("../benchmarks/arc_easy.txt");
+const WINOGRANDE_DATA: &str = include_str!("../benchmarks/winogrande.txt");
 
-pub fn load_boolq(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
-    let content = std::fs::read_to_string(path).expect("failed to read boolq");
+pub fn load_arc_easy(encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
+    // One "question? answer" per line. Split at the last '?' — prefix is context, suffix is the
+    // correct answer. Distractors are drawn from other lines' answers.
+    let pairs: Vec<(String, String)> = ARC_EASY_DATA.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let idx = line.rfind('?')?;
+            let ctx = line[..=idx].trim().to_string();
+            let ans = line[idx + 1..].trim().to_string();
+            if ctx.is_empty() || ans.is_empty() { None } else { Some((ctx, ans)) }
+        })
+        .collect();
+
+    if pairs.len() < 4 { return Vec::new(); }
+
+    let all_answers: Vec<Vec<u32>> = pairs.iter().map(|(_, a)| encode_fn(&format!(" {}", a))).collect();
+
+    let mut rng = rand::thread_rng();
+    use rand::seq::SliceRandom;
     let mut questions = Vec::new();
 
-    let yes_tokens = encode_fn(" Yes");
-    let no_tokens = encode_fn(" No");
-
-    for block in content.split("\n\n") {
+    for (idx, (ctx, _)) in pairs.iter().enumerate() {
         if questions.len() >= max_questions { break; }
-        let lines: Vec<&str> = block.lines().collect();
-        if lines.len() < 2 { continue; }
+        let context = encode_fn(ctx);
+        let correct = all_answers[idx].clone();
 
-        let last = lines.last().unwrap();
-        let is_yes = last.ends_with("Yes.") || last.ends_with("Yes");
+        let mut distractor_indices: Vec<usize> = (0..all_answers.len()).filter(|&i| i != idx).collect();
+        distractor_indices.shuffle(&mut rng);
 
-        let ctx_text = if lines.len() > 2 {
-            format!("{} {}", lines[..lines.len() - 1].join(" "),
-                    last.trim_end_matches("Yes.").trim_end_matches("No.").trim_end_matches("Yes").trim_end_matches("No").trim())
-        } else {
-            last.trim_end_matches("Yes.").trim_end_matches("No.").trim_end_matches("Yes").trim_end_matches("No").trim().to_string()
-        };
+        let mut choice_pairs: Vec<(Vec<u32>, bool)> = vec![(correct, true)];
+        for &di in distractor_indices.iter().take(3) {
+            choice_pairs.push((all_answers[di].clone(), false));
+        }
+        choice_pairs.shuffle(&mut rng);
 
-        let context = encode_fn(&ctx_text);
-        let label = if is_yes { 0 } else { 1 };
-
-        questions.push(McQuestion { context, choices: vec![yes_tokens.clone(), no_tokens.clone()], label });
+        let label = choice_pairs.iter().position(|(_, c)| *c).unwrap_or(0);
+        let choices: Vec<Vec<u32>> = choice_pairs.into_iter().map(|(c, _)| c).collect();
+        questions.push(McQuestion { context, choices, label });
     }
     questions
 }
 
-pub fn load_winogrande(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
-    load_qa_pairs(path, encode_fn, max_questions)
-}
-
-fn load_qa_pairs(path: &str, encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
-    let content = std::fs::read_to_string(path).expect("failed to read benchmark file");
+pub fn load_winogrande(encode_fn: &dyn Fn(&str) -> Vec<u32>, max_questions: usize) -> Vec<McQuestion> {
+    // Consecutive line pairs share a prefix; they diverge where the answer starts. Line 1 is the
+    // correct continuation, line 2 is the distractor. Score = log-prob of the divergent tail given
+    // the common prefix.
+    let lines: Vec<&str> = WINOGRANDE_DATA.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut questions = Vec::new();
-    let mut all_answers: Vec<Vec<u32>> = Vec::new();
 
-    for block in content.split("\n\n") {
-        let lines: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() >= 2 {
-            all_answers.push(encode_fn(lines.last().unwrap()));
-        }
-    }
-    if all_answers.len() < 4 { return questions; }
-
-    let mut rng = rand::thread_rng();
-    let mut idx = 0;
-    for block in content.split("\n\n") {
+    for pair in lines.chunks_exact(2) {
         if questions.len() >= max_questions { break; }
-        let lines: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() < 2 { continue; }
+        let a = pair[0].trim();
+        let b = pair[1].trim();
 
-        let context = encode_fn(lines[0]);
-        let correct = all_answers[idx].clone();
-
-        use rand::seq::SliceRandom;
-        let mut distractor_indices: Vec<usize> = (0..all_answers.len()).filter(|&i| i != idx).collect();
-        distractor_indices.shuffle(&mut rng);
-
-        let mut choices = vec![correct];
-        for &di in distractor_indices.iter().take(3) {
-            choices.push(all_answers[di].clone());
+        // Find common prefix length (in bytes, at char boundary).
+        let mut prefix_end = 0;
+        for ((i, ca), cb) in a.char_indices().zip(b.chars()) {
+            if ca != cb { break; }
+            prefix_end = i + ca.len_utf8();
         }
+        // Back up to the last space so we split cleanly on a word boundary.
+        while prefix_end > 0 && !a.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        if let Some(space_idx) = a[..prefix_end].rfind(' ') {
+            prefix_end = space_idx;
+        }
+        if prefix_end == 0 { continue; }
 
-        let mut choice_pairs: Vec<(Vec<u32>, bool)> = choices.into_iter()
-            .enumerate().map(|(i, c)| (c, i == 0)).collect();
-        choice_pairs.shuffle(&mut rng);
+        let context = encode_fn(a[..prefix_end].trim_end());
+        let tail_a = encode_fn(&a[prefix_end..]);
+        let tail_b = encode_fn(&b[prefix_end..]);
+        if tail_a.is_empty() || tail_b.is_empty() { continue; }
 
-        let label = choice_pairs.iter().position(|(_, is_correct)| *is_correct).unwrap_or(0);
-        let choices: Vec<Vec<u32>> = choice_pairs.into_iter().map(|(c, _)| c).collect();
-
-        questions.push(McQuestion { context, choices, label });
-        idx += 1;
+        questions.push(McQuestion { context, choices: vec![tail_a, tail_b], label: 0 });
     }
     questions
 }
@@ -301,7 +301,6 @@ pub fn run_eval(
     tokenizer: Option<&tokenizers::Tokenizer>,
     device: &Device,
     val_data: &str,
-    data_dir: &str,
 ) {
     eprintln!("=== Lumi Evaluation Suite{} ===\n",
         if config.byte_level { " (byte-level)" } else { "" });
@@ -320,32 +319,22 @@ pub fn run_eval(
         eprintln!("  {} not found, skipping\n", val_data);
     }
 
-    // --- Multiple Choice ---
+    // --- Multiple Choice (benchmarks are embedded in the binary) ---
     let mc_max = 200;
+    let mc_seq_len = config.max_seq_len.min(512);
 
-    let benchmark_configs: Vec<(&str, String)> = vec![
-        ("ARC-Easy", format!("{}/educational/arc-easy.txt", data_dir)),
-        ("BoolQ", format!("{}/educational/boolq.txt", data_dir)),
-        ("WinoGrande", format!("{}/educational/winogrande.txt", data_dir)),
+    let benchmarks: Vec<(&str, Vec<McQuestion>)> = vec![
+        ("ARC-Easy", load_arc_easy(&*encode_fn, mc_max)),
+        ("WinoGrande", load_winogrande(&*encode_fn, mc_max)),
     ];
 
-    for (name, path) in &benchmark_configs {
-        if !std::path::Path::new(path.as_str()).exists() {
-            eprintln!("--- {} ---\n  File not found: {}\n", name, path);
-            continue;
-        }
+    for (name, questions) in &benchmarks {
         eprintln!("--- {} ---", name);
-        let questions = match *name {
-            "ARC-Easy" => load_arc_easy(path, &*encode_fn, mc_max),
-            "BoolQ" => load_boolq(path, &*encode_fn, mc_max),
-            "WinoGrande" => load_winogrande(path, &*encode_fn, mc_max),
-            _ => continue,
-        };
         if questions.is_empty() {
             eprintln!("  No questions loaded\n");
             continue;
         }
-        match evaluate_mc(model, name, &questions, device, config.max_seq_len.min(512)) {
+        match evaluate_mc(model, name, questions, device, mc_seq_len) {
             Ok(result) => eprintln!("  {}: {:.1}% ({}/{})\n",
                 result.name, result.accuracy * 100.0, result.correct, result.total),
             Err(e) => eprintln!("  Error: {}\n", e),

@@ -54,9 +54,6 @@ enum Command {
         /// Path to val.bin for perplexity
         #[arg(long, default_value = "data/val.bin")]
         val_data: String,
-        /// Directory containing benchmark .txt files
-        #[arg(long, default_value = "data")]
-        data_dir: String,
     },
 }
 
@@ -179,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                 generated.len() as f64 / gen_time.as_secs_f64());
         }
 
-        Command::Evaluate { model, config, tokenizer, val_data, data_dir } => {
+        Command::Evaluate { model, config, tokenizer, val_data } => {
             let (model, config) = load_model(&model, &config, &device)?;
 
             let tok = if config.byte_level {
@@ -190,7 +187,7 @@ fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?)
             };
 
-            eval::run_eval(&model, &config, tok.as_ref(), &device, &val_data, &data_dir);
+            eval::run_eval(&model, &config, tok.as_ref(), &device, &val_data);
         }
     }
 

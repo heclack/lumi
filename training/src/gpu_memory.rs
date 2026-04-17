@@ -25,6 +25,10 @@ impl GpuBuf {
         Self { ptr, len: n }
     }
 
+    pub fn empty() -> Self {
+        Self { ptr: ptr::null_mut(), len: 0 }
+    }
+
     pub fn zero(&self) {
         unsafe {
             cuda_memset(self.ptr as *mut std::ffi::c_void, 0,
@@ -80,6 +84,41 @@ impl Drop for GpuBuf {
     }
 }
 
+/// GPU buffer for BF16 data (2 bytes per element). Used for mixed-precision scratch space.
+pub struct Bf16Buf {
+    pub ptr: *mut u16,
+    pub len: usize, // number of bf16 elements
+}
+
+impl Bf16Buf {
+    pub fn alloc(n: usize) -> Self {
+        let mut ptr: *mut u16 = ptr::null_mut();
+        let bytes = n * std::mem::size_of::<u16>();
+        unsafe {
+            let err = cuda_malloc(&mut ptr as *mut *mut u16 as *mut *mut std::ffi::c_void, bytes);
+            assert!(err == 0, "cudaMalloc (bf16) failed: {}", err);
+        }
+        Self { ptr, len: n }
+    }
+
+    /// Allocate a zero-sized dummy (no GPU memory). Used when mixed_precision is off.
+    pub fn empty() -> Self {
+        Self { ptr: ptr::null_mut(), len: 0 }
+    }
+}
+
+impl Drop for Bf16Buf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { cuda_free(self.ptr as *mut std::ffi::c_void); }
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for Bf16Buf {}
+unsafe impl Sync for Bf16Buf {}
+
 unsafe impl Send for GpuBuf {}
 unsafe impl Sync for GpuBuf {}
 
@@ -112,10 +151,28 @@ pub struct PerLayerSaved {
     pub lambda_raw: GpuBuf,  // [bs, n_heads] — pre-sigmoid λ (for sigmoid backward)
     pub dd_a_raw: GpuBuf,    // [bs, n_heads] — raw dd_A projection (for softplus backward)
     pub ssm_out: GpuBuf,     // [bs, d_inner] — SSM output (for gate backward)
-    pub z_act: GpuBuf,       // [bs, d_inner] — SiLU(z) (for gate backward)
     pub y_gated: GpuBuf,     // [bs, d_inner] — gated output (for out_proj weight grad)
     pub x_act: GpuBuf,       // [bs, d_inner] — post-SiLU x (for SSM input)
     pub theta_raw: GpuBuf,   // [bs, n_heads * d_state/2] — DD-RoPE theta (per timestep)
+}
+
+/// BF16 storage for per-layer Mamba saved activations.
+pub struct PerLayerSavedBf16 {
+    pub residual: Bf16Buf,
+    pub x_norm: Bf16Buf,
+    pub x_ssm_raw: Bf16Buf,
+    pub z_buf: Bf16Buf,
+    pub b_raw: Bf16Buf,
+    pub c_raw: Bf16Buf,
+    pub b_norm: Bf16Buf,
+    pub c_norm: Bf16Buf,
+    pub dt_buf: Bf16Buf,
+    pub lambda_raw: Bf16Buf,
+    pub dd_a_raw: Bf16Buf,
+    pub ssm_out: Bf16Buf,
+    pub y_gated: Bf16Buf,
+    pub x_act: Bf16Buf,
+    pub theta_raw: Bf16Buf,
 }
 
 /// Which type of block is at each layer position.
@@ -262,13 +319,14 @@ pub struct TrainingBuffers {
     pub x_ssm_raw: GpuBuf,    // [batch*seq, d_inner] (before SiLU, saved for backward)
     pub x_act: GpuBuf,        // [batch*seq, d_inner] (after SiLU)
     pub z_buf: GpuBuf,        // [batch*seq, d_inner] (gate branch)
-    pub z_act: GpuBuf,        // [batch*seq, d_inner] (SiLU(z))
     pub b_raw: GpuBuf,        // [batch*seq, n_groups*d_state] — before BCNorm
     pub c_raw: GpuBuf,        // [batch*seq, n_groups*d_state] — before BCNorm
     pub b_norm_buf: GpuBuf,   // [batch*seq, n_groups*d_state] — after BCNorm
     pub c_norm_buf: GpuBuf,   // [batch*seq, n_groups*d_state] — after BCNorm
     pub dt_buf: GpuBuf,       // [batch*seq, n_heads]
     pub lambda_raw: GpuBuf,   // [batch*seq, n_heads] — raw λ logits
+    pub dd_a_raw: GpuBuf,     // [batch*seq, n_heads] — raw dd_A projection
+    pub theta_raw: GpuBuf,    // [batch*seq, n_heads*d_state/2] — DD-RoPE theta
     pub lambda_buf: GpuBuf,   // [batch*seq, n_heads] — sigmoid(λ) ∈ [0,1]
     pub a_vals_buf: GpuBuf,   // [batch*seq, n_heads] — data-dependent A values (negative)
     pub ssm_out: GpuBuf,      // [batch*seq, d_inner] (= n_heads * head_dim)
@@ -353,6 +411,7 @@ pub struct TrainingBuffers {
 
     // Per-layer saved activations (for backward pass)
     pub saved: Vec<PerLayerSaved>,                  // Mamba saved
+    pub saved_bf16: Vec<PerLayerSavedBf16>,         // BF16 Mamba saved
     pub attn_saved: Vec<AttentionPerLayerSaved>,    // Attention saved
 
     // Layer dispatch map
@@ -382,6 +441,18 @@ pub struct TrainingBuffers {
     pub n_groups: usize,
     pub d_state: usize,
     pub vocab: usize,
+    pub bf16_activations: bool,
+
+    // BF16 backward staging buffers for saved activations
+    pub bwd_stage_a: GpuBuf,
+    pub bwd_stage_b: GpuBuf,
+    pub bwd_stage_c: GpuBuf,
+    pub bwd_stage_d: GpuBuf,
+    pub bwd_stage_e: GpuBuf,
+
+    // BF16 scratch buffers for mixed-precision matmuls
+    pub bf16_scratch_a: Bf16Buf,
+    pub bf16_scratch_b: Bf16Buf,
 }
 
 /// Gradient accumulators for one Mamba layer.
@@ -435,7 +506,13 @@ pub struct ParamAdamState {
 }
 
 impl TrainingBuffers {
-    pub fn allocate(config: &ModelConfig, batch: usize, seq: usize) -> Self {
+    pub fn allocate(
+        config: &ModelConfig,
+        batch: usize,
+        seq: usize,
+        mixed_precision: bool,
+        bf16_activations: bool,
+    ) -> Self {
         let bs = batch * seq;
         let d_model = config.d_model;
         let d_inner = config.d_inner();
@@ -448,6 +525,8 @@ impl TrainingBuffers {
         let in_proj_out = d_inner + d_inner + bc_size * 2 + n_heads * 3 + theta_proj;
         let vocab = config.vocab_size;
         let n_layers = config.n_layers;
+        let has_attention = config.n_attn_layers() > 0;
+        let bwd_stage_size = bs * d_inner;
 
         eprintln!("Allocating native GPU training buffers...");
         let total_mb = (
@@ -474,13 +553,14 @@ impl TrainingBuffers {
         let x_ssm_raw = GpuBuf::alloc(bs * d_inner);
         let x_act = GpuBuf::alloc(bs * d_inner);
         let z_buf = GpuBuf::alloc(bs * d_inner);
-        let z_act = GpuBuf::alloc(bs * d_inner);
         let b_raw = GpuBuf::alloc(bs * bc_size);
         let c_raw = GpuBuf::alloc(bs * bc_size);
         let b_norm_buf = GpuBuf::alloc(bs * bc_size);
         let c_norm_buf = GpuBuf::alloc(bs * bc_size);
         let dt_buf = GpuBuf::alloc(bs * n_heads);
         let lambda_raw = GpuBuf::alloc(bs * n_heads);  // raw λ logits from in_proj
+        let dd_a_raw = GpuBuf::alloc(bs * n_heads);    // raw dd_A logits from in_proj
+        let theta_raw = GpuBuf::alloc(bs * theta_proj); // raw DD-RoPE theta from in_proj
         let lambda_buf = GpuBuf::alloc(bs * n_heads);  // sigmoid(λ) ∈ [0,1]
         let a_vals_buf = GpuBuf::alloc(bs * n_heads);  // data-dependent A values
         let ssm_out = GpuBuf::alloc(bs * d_inner);
@@ -503,6 +583,12 @@ impl TrainingBuffers {
         let d_lambda = GpuBuf::alloc(bs * n_heads);
         let d_a_vals = GpuBuf::alloc(bs * n_heads);
         let d_theta_raw = GpuBuf::alloc(bs * n_heads * d_state / 2);
+
+        let bwd_stage_a = if bf16_activations { GpuBuf::alloc(bwd_stage_size) } else { GpuBuf::empty() };
+        let bwd_stage_b = if bf16_activations { GpuBuf::alloc(bwd_stage_size) } else { GpuBuf::empty() };
+        let bwd_stage_c = if bf16_activations { GpuBuf::alloc(bwd_stage_size) } else { GpuBuf::empty() };
+        let bwd_stage_d = if bf16_activations { GpuBuf::alloc(bwd_stage_size) } else { GpuBuf::empty() };
+        let bwd_stage_e = if bf16_activations { GpuBuf::alloc(bwd_stage_size) } else { GpuBuf::empty() };
 
         // SSM backward workspace (batch * n_heads — reused across layers)
         let ws_d_d_buf = GpuBuf::alloc(batch * n_heads);
@@ -543,7 +629,8 @@ impl TrainingBuffers {
         let mut d_layers = Vec::with_capacity(n_layers);
         let mut adam_m = Vec::with_capacity(n_layers);
         let mut small_adam = Vec::with_capacity(n_layers);
-        let mut saved = Vec::with_capacity(n_layers);
+        let mut saved = if bf16_activations { Vec::new() } else { Vec::with_capacity(n_layers) };
+        let mut saved_bf16 = if bf16_activations { Vec::with_capacity(n_layers) } else { Vec::new() };
 
         for _ in 0..n_layers {
             layers.push(LayerWeights {
@@ -567,24 +654,43 @@ impl TrainingBuffers {
             // Adam m/v for small per-layer params
             small_adam.push(SmallParamAdam::alloc(d_model, bc_size, n_heads, d_state));
             // Per-layer saved activations
-            saved.push(PerLayerSaved {
-                residual: GpuBuf::alloc(bs * d_model),
-                x_norm: GpuBuf::alloc(bs * d_model),
-                x_ssm_raw: GpuBuf::alloc(bs * d_inner),
-                z_buf: GpuBuf::alloc(bs * d_inner),
-                b_raw: GpuBuf::alloc(bs * bc_size),
-                c_raw: GpuBuf::alloc(bs * bc_size),
-                b_norm: GpuBuf::alloc(bs * bc_size),
-                c_norm: GpuBuf::alloc(bs * bc_size),
-                dt_buf: GpuBuf::alloc(bs * n_heads),
-                lambda_raw: GpuBuf::alloc(bs * n_heads),
-                dd_a_raw: GpuBuf::alloc(bs * n_heads),
-                ssm_out: GpuBuf::alloc(bs * d_inner),
-                z_act: GpuBuf::alloc(bs * d_inner),
-                y_gated: GpuBuf::alloc(bs * d_inner),
-                x_act: GpuBuf::alloc(bs * d_inner),
-                theta_raw: GpuBuf::alloc(bs * n_heads * d_state / 2),
-            });
+            if bf16_activations {
+                saved_bf16.push(PerLayerSavedBf16 {
+                    residual: Bf16Buf::alloc(bs * d_model),
+                    x_norm: Bf16Buf::alloc(bs * d_model),
+                    x_ssm_raw: Bf16Buf::alloc(bs * d_inner),
+                    z_buf: Bf16Buf::alloc(bs * d_inner),
+                    b_raw: Bf16Buf::alloc(bs * bc_size),
+                    c_raw: Bf16Buf::alloc(bs * bc_size),
+                    b_norm: Bf16Buf::alloc(bs * bc_size),
+                    c_norm: Bf16Buf::alloc(bs * bc_size),
+                    dt_buf: Bf16Buf::alloc(bs * n_heads),
+                    lambda_raw: Bf16Buf::alloc(bs * n_heads),
+                    dd_a_raw: Bf16Buf::alloc(bs * n_heads),
+                    ssm_out: Bf16Buf::alloc(bs * d_inner),
+                    y_gated: Bf16Buf::alloc(bs * d_inner),
+                    x_act: Bf16Buf::alloc(bs * d_inner),
+                    theta_raw: Bf16Buf::alloc(bs * theta_proj),
+                });
+            } else {
+                saved.push(PerLayerSaved {
+                    residual: GpuBuf::alloc(bs * d_model),
+                    x_norm: GpuBuf::alloc(bs * d_model),
+                    x_ssm_raw: GpuBuf::alloc(bs * d_inner),
+                    z_buf: GpuBuf::alloc(bs * d_inner),
+                    b_raw: GpuBuf::alloc(bs * bc_size),
+                    c_raw: GpuBuf::alloc(bs * bc_size),
+                    b_norm: GpuBuf::alloc(bs * bc_size),
+                    c_norm: GpuBuf::alloc(bs * bc_size),
+                    dt_buf: GpuBuf::alloc(bs * n_heads),
+                    lambda_raw: GpuBuf::alloc(bs * n_heads),
+                    dd_a_raw: GpuBuf::alloc(bs * n_heads),
+                    ssm_out: GpuBuf::alloc(bs * d_inner),
+                    y_gated: GpuBuf::alloc(bs * d_inner),
+                    x_act: GpuBuf::alloc(bs * d_inner),
+                    theta_raw: GpuBuf::alloc(bs * theta_proj),
+                });
+            }
         }
 
         // Attention layer allocation
@@ -610,31 +716,31 @@ impl TrainingBuffers {
         eprintln!("  Layer types: {} Mamba + {} Attention", n_mamba, n_attn);
 
         // Shared attention activation buffers (reused across attention layers)
-        let attn_scores_size = batch * attn_n_heads * seq * seq;
-        let attn_q = GpuBuf::alloc(bs * d_model);
-        let attn_k = GpuBuf::alloc(bs * kv_dim);
-        let attn_v = GpuBuf::alloc(bs * kv_dim);
-        let attn_q_t = GpuBuf::alloc(bs * d_model);  // [batch, n_heads, seq, head_dim]
-        let attn_k_t = GpuBuf::alloc(bs * d_model);  // expanded from kv_heads to n_heads
-        let attn_v_t = GpuBuf::alloc(bs * d_model);
-        let attn_context_t = GpuBuf::alloc(bs * d_model);
-        let attn_scores = GpuBuf::alloc(attn_scores_size);
-        let attn_weights = GpuBuf::alloc(attn_scores_size);
-        let attn_context = GpuBuf::alloc(bs * d_model);
-        let attn_mlp_hidden = GpuBuf::alloc(bs * mlp_dim);
-        let attn_mlp_gated = GpuBuf::alloc(bs * mlp_dim);
-        let attn_kv_temp = GpuBuf::alloc(bs * kv_dim);  // temp for transpose before GQA expand (avoids in-place race)
-        let d_attn_q = GpuBuf::alloc(bs * d_model);
-        let d_attn_k = GpuBuf::alloc(bs * kv_dim);
-        let d_attn_v = GpuBuf::alloc(bs * kv_dim);
-        let d_attn_q_t = GpuBuf::alloc(bs * d_model);
-        let d_attn_k_t = GpuBuf::alloc(bs * d_model);
-        let d_attn_v_t = GpuBuf::alloc(bs * d_model);
-        let d_attn_context_t = GpuBuf::alloc(bs * d_model);
-        let d_attn_scores = GpuBuf::alloc(attn_scores_size);
-        let d_attn_context = GpuBuf::alloc(bs * d_model);
-        let d_attn_mlp_hidden = GpuBuf::alloc(bs * mlp_dim);
-        let d_attn_mlp_gated = GpuBuf::alloc(bs * mlp_dim);
+        let attn_scores_size = if has_attention { batch * attn_n_heads * seq * seq } else { 0 };
+        let attn_q = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let attn_k = if has_attention { GpuBuf::alloc(bs * kv_dim) } else { GpuBuf::empty() };
+        let attn_v = if has_attention { GpuBuf::alloc(bs * kv_dim) } else { GpuBuf::empty() };
+        let attn_q_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };  // [batch, n_heads, seq, head_dim]
+        let attn_k_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };  // expanded from kv_heads to n_heads
+        let attn_v_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let attn_context_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let attn_scores = if has_attention { GpuBuf::alloc(attn_scores_size) } else { GpuBuf::empty() };
+        let attn_weights = if has_attention { GpuBuf::alloc(attn_scores_size) } else { GpuBuf::empty() };
+        let attn_context = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let attn_mlp_hidden = if has_attention { GpuBuf::alloc(bs * mlp_dim) } else { GpuBuf::empty() };
+        let attn_mlp_gated = if has_attention { GpuBuf::alloc(bs * mlp_dim) } else { GpuBuf::empty() };
+        let attn_kv_temp = if has_attention { GpuBuf::alloc(bs * kv_dim) } else { GpuBuf::empty() };  // temp for transpose before GQA expand (avoids in-place race)
+        let d_attn_q = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_k = if has_attention { GpuBuf::alloc(bs * kv_dim) } else { GpuBuf::empty() };
+        let d_attn_v = if has_attention { GpuBuf::alloc(bs * kv_dim) } else { GpuBuf::empty() };
+        let d_attn_q_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_k_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_v_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_context_t = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_scores = if has_attention { GpuBuf::alloc(attn_scores_size) } else { GpuBuf::empty() };
+        let d_attn_context = if has_attention { GpuBuf::alloc(bs * d_model) } else { GpuBuf::empty() };
+        let d_attn_mlp_hidden = if has_attention { GpuBuf::alloc(bs * mlp_dim) } else { GpuBuf::empty() };
+        let d_attn_mlp_gated = if has_attention { GpuBuf::alloc(bs * mlp_dim) } else { GpuBuf::empty() };
 
         // Per-attention-layer weights, gradients, saved activations, Adam
         let mut attn_layers_vec = Vec::with_capacity(n_attn);
@@ -642,8 +748,12 @@ impl TrainingBuffers {
         let mut attn_saved = Vec::with_capacity(n_attn);
         let mut attn_adam = Vec::with_capacity(n_attn);
 
-        let attn_large_size = d_model * d_model * 2 + d_model * kv_dim * 2 // Q,K,V,out projections
-            + d_model * mlp_dim * 2 + mlp_dim * d_model; // gate,up,down
+        let attn_large_size = if has_attention {
+            d_model * d_model * 2 + d_model * kv_dim * 2 // Q,K,V,out projections
+                + d_model * mlp_dim * 2 + mlp_dim * d_model // gate,up,down
+        } else {
+            0
+        };
 
         for _ in 0..n_attn {
             attn_layers_vec.push(AttentionLayerWeights {
@@ -692,8 +802,8 @@ impl TrainingBuffers {
         eprintln!("  Native GPU buffers allocated.");
 
         Self {
-            x, x_norm, projected, x_ssm_raw, x_act, z_buf, z_act,
-            b_raw, c_raw, b_norm_buf, c_norm_buf, dt_buf, lambda_raw, lambda_buf, a_vals_buf,
+            x, x_norm, projected, x_ssm_raw, x_act, z_buf,
+            b_raw, c_raw, b_norm_buf, c_norm_buf, dt_buf, lambda_raw, dd_a_raw, theta_raw, lambda_buf, a_vals_buf,
             ssm_out, y_gated, block_out, residual,
             d_x, d_x_norm, d_projected, d_x_act, d_z,
             d_ssm_out, d_y_gated, d_block_out, d_b_norm, d_c_norm, d_dt, d_lambda, d_a_vals, d_theta_raw,
@@ -712,13 +822,48 @@ impl TrainingBuffers {
             d_embedding, d_final_norm_gamma,
             layers, d_layers,
             attn_layers: attn_layers_vec, d_attn_layers,
-            saved, attn_saved,
+            saved, saved_bf16, attn_saved,
             layer_types,
             adam_m, small_adam, attn_adam,
             final_norm_adam_m, final_norm_adam_v,
             embedding_adam_m, embedding_adam_v,
             batch_seq: bs, d_model, d_inner, in_proj_out,
-            n_heads, n_groups, d_state, vocab,
+            n_heads, n_groups, d_state, vocab, bf16_activations,
+            bwd_stage_a, bwd_stage_b, bwd_stage_c, bwd_stage_d, bwd_stage_e,
+            bf16_scratch_a: if mixed_precision {
+                // Size to max element count across all BF16 matmul A inputs
+                let attn_heads = config.attn_n_heads;
+                let head_dim_attn = d_model / attn_heads;
+                let kv_dim = config.attn_kv_heads * head_dim_attn;
+                let mlp_dim = config.attn_mlp_expand * d_model;
+                let mut candidates = vec![
+                    bs * d_model, bs * d_inner, bs * in_proj_out,
+                    d_model * in_proj_out, d_inner * d_model,
+                ];
+                if has_attention {
+                    candidates.push(bs * kv_dim);
+                    candidates.push(bs * mlp_dim);
+                    candidates.push(batch * attn_heads * seq * seq);
+                    candidates.push(batch * attn_heads * seq * head_dim_attn);
+                }
+                Bf16Buf::alloc(*candidates.iter().max().unwrap())
+            } else { Bf16Buf::empty() },
+            bf16_scratch_b: if mixed_precision {
+                let attn_heads = config.attn_n_heads;
+                let head_dim_attn = d_model / attn_heads;
+                let kv_dim = config.attn_kv_heads * head_dim_attn;
+                let mlp_dim = config.attn_mlp_expand * d_model;
+                let mut candidates = vec![
+                    d_model * in_proj_out, d_inner * d_model,
+                    d_model * d_model, d_model * kv_dim,
+                    d_model * mlp_dim, mlp_dim * d_model,
+                ];
+                if has_attention {
+                    candidates.push(batch * attn_heads * seq * seq);
+                    candidates.push(batch * attn_heads * seq * head_dim_attn);
+                }
+                Bf16Buf::alloc(*candidates.iter().max().unwrap())
+            } else { Bf16Buf::empty() },
         }
     }
 }

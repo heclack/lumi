@@ -10,9 +10,26 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdio>
 
 static cublasHandle_t g_cublas_handle = nullptr;
+
+/* ─── BF16 conversion kernel (defined before extern "C" for __global__) ───── */
+
+__global__ void f32_to_bf16_kernel(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __float2bfloat16(in[idx]);
+    }
+}
+
+__global__ void bf16_to_f32_kernel(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __bfloat162float(in[idx]);
+    }
+}
 
 extern "C" {
 
@@ -254,6 +271,195 @@ void matmul_f32_at_batched(
         &beta,
         C, n, strideC,
         batch_count
+    );
+}
+
+/* ─── BF16 Mixed-Precision Support ─────────────────────────────────────────── */
+
+/*
+ * FP32 → BF16 conversion kernel.
+ * Simple element-wise truncation (BF16 = upper 16 bits of FP32 with rounding).
+ */
+void convert_f32_to_bf16(const float* in, __nv_bfloat16* out, int n) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    f32_to_bf16_kernel<<<blocks, threads>>>(in, out, n);
+}
+
+void convert_bf16_to_f32(const __nv_bfloat16* in, float* out, int n) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    bf16_to_f32_kernel<<<blocks, threads>>>(in, out, n);
+}
+
+/*
+ * BF16 matmul wrappers: accept FP32 inputs + BF16 scratch, convert, then GemmEx.
+ * Output is always FP32. Compute is FP32 (accumulate in full precision).
+ * Uses BF16 tensor cores on A100+ (312 TFLOPS vs 156 TFLOPS for TF32).
+ */
+
+/* C = A @ B (row-major) */
+void matmul_bf16_from_f32(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k
+) {
+    int threads = 256;
+    int a_n = m * k, b_n = k * n;
+    f32_to_bf16_kernel<<<(a_n+threads-1)/threads, threads>>>(A, scratch_a, a_n);
+    f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, n,
+        scratch_a, CUDA_R_16BF, k,
+        &beta,
+        C, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+}
+
+/* C = A @ B^T (row-major) */
+void matmul_bf16_from_f32_bt(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k
+) {
+    int threads = 256;
+    int a_n = m * k, b_n = n * k;
+    f32_to_bf16_kernel<<<(a_n+threads-1)/threads, threads>>>(A, scratch_a, a_n);
+    f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, k,
+        scratch_a, CUDA_R_16BF, k,
+        &beta,
+        C, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+}
+
+/* C += A^T @ B (row-major, accumulate) */
+void matmul_bf16_from_f32_at_accum(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k
+) {
+    int threads = 256;
+    int a_n = k * m, b_n = k * n;
+    f32_to_bf16_kernel<<<(a_n+threads-1)/threads, threads>>>(A, scratch_a, a_n);
+    f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
+
+    float alpha = 1.0f, beta = 1.0f;
+    cublasGemmEx(g_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, n,
+        scratch_a, CUDA_R_16BF, m,
+        &beta,
+        C, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+}
+
+/* Batched: C[i] = A[i] @ B[i] */
+void matmul_bf16_from_f32_batched(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k, int batch_count
+) {
+    int threads = 256;
+    int a_total = batch_count * m * k, b_total = batch_count * k * n;
+    f32_to_bf16_kernel<<<(a_total+threads-1)/threads, threads>>>(A, scratch_a, a_total);
+    f32_to_bf16_kernel<<<(b_total+threads-1)/threads, threads>>>(B, scratch_b, b_total);
+
+    float alpha = 1.0f, beta = 0.0f;
+    long long strideA = (long long)m * k;
+    long long strideB = (long long)k * n;
+    long long strideC = (long long)m * n;
+
+    cublasGemmStridedBatchedEx(g_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, n, strideB,
+        scratch_a, CUDA_R_16BF, k, strideA,
+        &beta,
+        C, CUDA_R_32F, n, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+}
+
+/* Batched: C[i] = A[i] @ B[i]^T */
+void matmul_bf16_from_f32_bt_batched(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k, int batch_count
+) {
+    int threads = 256;
+    int a_total = batch_count * m * k, b_total = batch_count * n * k;
+    f32_to_bf16_kernel<<<(a_total+threads-1)/threads, threads>>>(A, scratch_a, a_total);
+    f32_to_bf16_kernel<<<(b_total+threads-1)/threads, threads>>>(B, scratch_b, b_total);
+
+    float alpha = 1.0f, beta = 0.0f;
+    long long strideA = (long long)m * k;
+    long long strideB = (long long)n * k;
+    long long strideC = (long long)m * n;
+
+    cublasGemmStridedBatchedEx(g_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, k, strideB,
+        scratch_a, CUDA_R_16BF, k, strideA,
+        &beta,
+        C, CUDA_R_32F, n, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+}
+
+/* Batched: C[i] = A[i]^T @ B[i] */
+void matmul_bf16_from_f32_at_batched(
+    const float* A, const float* B, float* C,
+    __nv_bfloat16* scratch_a, __nv_bfloat16* scratch_b,
+    int m, int n, int k, int batch_count
+) {
+    int threads = 256;
+    int a_total = batch_count * k * m, b_total = batch_count * k * n;
+    f32_to_bf16_kernel<<<(a_total+threads-1)/threads, threads>>>(A, scratch_a, a_total);
+    f32_to_bf16_kernel<<<(b_total+threads-1)/threads, threads>>>(B, scratch_b, b_total);
+
+    float alpha = 1.0f, beta = 0.0f;
+    long long strideA = (long long)k * m;
+    long long strideB = (long long)k * n;
+    long long strideC = (long long)m * n;
+
+    cublasGemmStridedBatchedEx(g_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        n, m, k,
+        &alpha,
+        scratch_b, CUDA_R_16BF, n, strideB,
+        scratch_a, CUDA_R_16BF, m, strideA,
+        &beta,
+        C, CUDA_R_32F, n, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
 }
 

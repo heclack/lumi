@@ -22,8 +22,7 @@ lumi-infer evaluate \
   -m model.safetensors \
   -c config.json \
   -t tokenizer.json \
-  --val-data data/val.bin \
-  --data-dir data
+  --val-data data/val.bin
 ```
 
 Use `--cpu` (global flag, before subcommand) to force CPU instead of Metal GPU.
@@ -86,7 +85,8 @@ Set `n_layers` to match the exported model (48 for base, 96 for doubled). Set `a
 | `--config` | `-c` | required | Path to model config JSON |
 | `--tokenizer` | `-t` | optional | Path to tokenizer JSON (omit for byte-level models) |
 | `--val-data` | | `data/val.bin` | Validation data for perplexity |
-| `--data-dir` | | `data` | Directory with benchmark `.txt` files (ARC-Easy, BoolQ, WinoGrande) |
+
+MC benchmarks (ARC-Easy, WinoGrande) are embedded in the binary — see `benchmarks/`. No external files required.
 
 ## Architecture
 

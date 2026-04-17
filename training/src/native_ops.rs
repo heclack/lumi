@@ -175,6 +175,41 @@ extern "C" {
         batch: i32, seq: i32, n_heads: i32, head_dim: i32, d_state: i32, n_groups: i32,
         chunk_size: i32,
     );
+
+    // ─── BF16 Mixed-Precision Matmuls ───
+    pub fn convert_f32_to_bf16(input: *const f32, output: *mut u16, n: i32);
+    pub fn convert_bf16_to_f32(input: *const u16, output: *mut f32, n: i32);
+
+    pub fn matmul_bf16_from_f32(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32,
+    );
+    pub fn matmul_bf16_from_f32_bt(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32,
+    );
+    pub fn matmul_bf16_from_f32_at_accum(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32,
+    );
+    pub fn matmul_bf16_from_f32_batched(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32, batch_count: i32,
+    );
+    pub fn matmul_bf16_from_f32_bt_batched(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32, batch_count: i32,
+    );
+    pub fn matmul_bf16_from_f32_at_batched(
+        A: *const f32, B: *const f32, C: *mut f32,
+        scratch_a: *mut u16, scratch_b: *mut u16,
+        m: i32, n: i32, k: i32, batch_count: i32,
+    );
 }
 
 // Stubs for non-CUDA builds

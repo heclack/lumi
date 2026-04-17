@@ -205,6 +205,12 @@ pub struct TrainingConfig {
     pub val_data: String,
     /// Training sequence length. 0 = use model.max_seq_len.
     pub seq_len: usize,
+    /// Use BF16 mixed-precision for matmul operations (requires sm_80+).
+    /// Weights/gradients/optimizer stay FP32; only matmul inputs are converted to BF16.
+    pub mixed_precision: bool,
+    /// Use BF16 storage for per-layer saved activations.
+    /// This is independent from mixed_precision and only affects activation saves.
+    pub bf16_activations: bool,
 }
 
 impl Default for TrainingConfig {
@@ -227,6 +233,8 @@ impl Default for TrainingConfig {
             train_data: "data/train.bin".to_string(),
             val_data: "data/val.bin".to_string(),
             seq_len: 0,
+            mixed_precision: false,
+            bf16_activations: false,
         }
     }
 }
