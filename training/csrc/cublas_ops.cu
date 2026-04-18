@@ -15,6 +15,25 @@
 
 static cublasHandle_t g_cublas_handle = nullptr;
 
+/* cuBLAS status check. On failure, print a one-shot message (subsequent failures
+ * in the same run stay silent to avoid spamming logs) and abort so the training
+ * loop doesn't silently spin on a sticky CUDA error state. Also reports any
+ * lingering CUDA error from a prior kernel launch — cuBLAS will surface those
+ * as CUBLAS_STATUS_EXECUTION_FAILED even though the gemm itself is fine. */
+static void check_cublas_status(cublasStatus_t status, const char* op, const char* file, int line) {
+    if (status == CUBLAS_STATUS_SUCCESS) return;
+    static bool reported = false;
+    if (!reported) {
+        cudaError_t lingering = cudaGetLastError();
+        fprintf(stderr,
+            "cuBLAS %s failed: status=%d at %s:%d  (prior CUDA error: %s)\n",
+            op, (int)status, file, line, cudaGetErrorString(lingering));
+        reported = true;
+    }
+    abort();
+}
+#define CUBLAS_CHECK(call) check_cublas_status((call), #call, __FILE__, __LINE__)
+
 /* ─── BF16 conversion kernel (defined before extern "C" for __global__) ───── */
 
 __global__ void f32_to_bf16_kernel(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, int n) {
@@ -40,9 +59,16 @@ void cublas_init() {
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr, "cuBLAS init failed: %d\n", status);
         }
-        /* Enable TF32 tensor core math for all sgemm calls.
-         * A100+: 156 TFLOPS (TF32) vs 19.5 TFLOPS (f32 CUDA cores).
-         * 10-bit mantissa is sufficient precision for training. */
+        /* Enable TF32 tensor cores for FP32 gemms on A100+
+         * (156 TFLOPS TF32 vs 19.5 TFLOPS plain FP32, 8x speedup).
+         * 10-bit mantissa is sufficient for training.
+         *
+         * NOTE: When BF16 mixed-precision was enabled on CUDA 12.8, gemms
+         * with OP_T failed with CUBLAS_STATUS_EXECUTION_FAILED. The failure
+         * was actually a poisoned CUDA context from an illegal memory access
+         * in some earlier BF16 kernel — not caused by this math mode — but
+         * symptoms surfaced here, so noted for the next person who touches
+         * mixed_precision=true. See LOCAL/spark/incremental-training.md. */
         cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
     }
 }
@@ -310,7 +336,7 @@ void matmul_bf16_from_f32(
     f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
 
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmEx(g_cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         n, m, k,
         &alpha,
@@ -319,8 +345,8 @@ void matmul_bf16_from_f32(
         &beta,
         C, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 /* C = A @ B^T (row-major) */
@@ -335,7 +361,7 @@ void matmul_bf16_from_f32_bt(
     f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
 
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmEx(g_cublas_handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         n, m, k,
         &alpha,
@@ -344,8 +370,8 @@ void matmul_bf16_from_f32_bt(
         &beta,
         C, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 /* C += A^T @ B (row-major, accumulate) */
@@ -360,7 +386,7 @@ void matmul_bf16_from_f32_at_accum(
     f32_to_bf16_kernel<<<(b_n+threads-1)/threads, threads>>>(B, scratch_b, b_n);
 
     float alpha = 1.0f, beta = 1.0f;
-    cublasGemmEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmEx(g_cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_T,
         n, m, k,
         &alpha,
@@ -369,8 +395,8 @@ void matmul_bf16_from_f32_at_accum(
         &beta,
         C, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 /* Batched: C[i] = A[i] @ B[i] */
@@ -389,7 +415,7 @@ void matmul_bf16_from_f32_batched(
     long long strideB = (long long)k * n;
     long long strideC = (long long)m * n;
 
-    cublasGemmStridedBatchedEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(g_cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         n, m, k,
         &alpha,
@@ -399,8 +425,8 @@ void matmul_bf16_from_f32_batched(
         C, CUDA_R_32F, n, strideC,
         batch_count,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 /* Batched: C[i] = A[i] @ B[i]^T */
@@ -419,7 +445,7 @@ void matmul_bf16_from_f32_bt_batched(
     long long strideB = (long long)n * k;
     long long strideC = (long long)m * n;
 
-    cublasGemmStridedBatchedEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(g_cublas_handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         n, m, k,
         &alpha,
@@ -429,8 +455,8 @@ void matmul_bf16_from_f32_bt_batched(
         C, CUDA_R_32F, n, strideC,
         batch_count,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 /* Batched: C[i] = A[i]^T @ B[i] */
@@ -449,7 +475,7 @@ void matmul_bf16_from_f32_at_batched(
     long long strideB = (long long)k * n;
     long long strideC = (long long)m * n;
 
-    cublasGemmStridedBatchedEx(g_cublas_handle,
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(g_cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_T,
         n, m, k,
         &alpha,
@@ -459,8 +485,8 @@ void matmul_bf16_from_f32_at_batched(
         C, CUDA_R_32F, n, strideC,
         batch_count,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+        CUBLAS_GEMM_DEFAULT
+    ));
 }
 
 } /* extern "C" */

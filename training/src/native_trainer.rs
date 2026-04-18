@@ -568,7 +568,14 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
         }
 
         if step == start_step {
-            unsafe { native_ops::cudaDeviceSynchronize(); }
+            // Sync at the forward/backward boundary so any illegal-memory-access
+            // error from a forward kernel is surfaced *here* instead of poisoning
+            // the first cuBLAS call in backward. The return value is the first
+            // error encountered since the last check — abort on non-zero.
+            let sync_status = unsafe { native_ops::cudaDeviceSynchronize() };
+            if sync_status != 0 {
+                panic!("CUDA error at forward/backward boundary: {}", sync_status);
+            }
             eprintln!("  Forward pass complete ({:.1}s)", start_time.elapsed().as_secs_f32());
         }
         // ──── BACKWARD PASS (all on GPU, reverse order) ────
@@ -1380,7 +1387,10 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
         }
 
         // ──── CHECKPOINT ────
-        if step > 0 && step % config.checkpoint_interval == 0 {
+        // Skip the resume step — we just loaded these weights, re-saving would
+        // only overwrite a pristine source-of-truth checkpoint with itself (and
+        // clobber the original meta.json in the process).
+        if step > 0 && step != start_step && step % config.checkpoint_interval == 0 {
             let ckpt_dir = format!("checkpoints/step-{:06}", step);
             let meta = serde_json::json!({
                 "step": step,
