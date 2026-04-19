@@ -61,14 +61,7 @@ void cublas_init() {
         }
         /* Enable TF32 tensor cores for FP32 gemms on A100+
          * (156 TFLOPS TF32 vs 19.5 TFLOPS plain FP32, 8x speedup).
-         * 10-bit mantissa is sufficient for training.
-         *
-         * NOTE: When BF16 mixed-precision was enabled on CUDA 12.8, gemms
-         * with OP_T failed with CUBLAS_STATUS_EXECUTION_FAILED. The failure
-         * was actually a poisoned CUDA context from an illegal memory access
-         * in some earlier BF16 kernel — not caused by this math mode — but
-         * symptoms surfaced here, so noted for the next person who touches
-         * mixed_precision=true. See LOCAL/spark/incremental-training.md. */
+         * 10-bit mantissa is sufficient for training. */
         cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
     }
 }

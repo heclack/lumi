@@ -831,41 +831,65 @@ impl TrainingBuffers {
             n_heads, n_groups, d_state, vocab, bf16_activations,
             bwd_stage_a, bwd_stage_b, bwd_stage_c, bwd_stage_d, bwd_stage_e,
             bf16_scratch_a: if mixed_precision {
-                // Size to max element count across all BF16 matmul A inputs
-                let attn_heads = config.attn_n_heads;
-                let head_dim_attn = d_model / attn_heads;
-                let kv_dim = config.attn_kv_heads * head_dim_attn;
-                let mlp_dim = config.attn_mlp_expand * d_model;
-                let mut candidates = vec![
-                    bs * d_model, bs * d_inner, bs * in_proj_out,
-                    d_model * in_proj_out, d_inner * d_model,
-                ];
-                if has_attention {
-                    candidates.push(bs * kv_dim);
-                    candidates.push(bs * mlp_dim);
-                    candidates.push(batch * attn_heads * seq * seq);
-                    candidates.push(batch * attn_heads * seq * head_dim_attn);
-                }
-                Bf16Buf::alloc(*candidates.iter().max().unwrap())
+                Bf16Buf::alloc(bf16_scratch_size(config, batch, seq, has_attention))
             } else { Bf16Buf::empty() },
             bf16_scratch_b: if mixed_precision {
-                let attn_heads = config.attn_n_heads;
-                let head_dim_attn = d_model / attn_heads;
-                let kv_dim = config.attn_kv_heads * head_dim_attn;
-                let mlp_dim = config.attn_mlp_expand * d_model;
-                let mut candidates = vec![
-                    d_model * in_proj_out, d_inner * d_model,
-                    d_model * d_model, d_model * kv_dim,
-                    d_model * mlp_dim, mlp_dim * d_model,
-                ];
-                if has_attention {
-                    candidates.push(batch * attn_heads * seq * seq);
-                    candidates.push(batch * attn_heads * seq * head_dim_attn);
-                }
-                Bf16Buf::alloc(*candidates.iter().max().unwrap())
+                Bf16Buf::alloc(bf16_scratch_size(config, batch, seq, has_attention))
             } else { Bf16Buf::empty() },
         }
     }
+}
+
+/// Max element count any BF16 matmul wrapper will try to convert into a scratch
+/// buffer. Covers BOTH the A and B slot across every mm/mm_bt/mm_at_accum call
+/// in forward and backward — the same buffer size is allocated for both scratches
+/// because `bf16_scratch_b` needs activation-shaped sizes in backward (B = d_projected,
+/// d_attn_q, etc.) just as `bf16_scratch_a` needs weight-shaped sizes when it is
+/// the accumulating LHS. Under-sizing `scratch_b` was the bug behind the
+/// cublasGemmEx EXECUTION_FAILED at scale — out-of-bounds f32_to_bf16 writes.
+fn bf16_scratch_size(config: &ModelConfig, batch: usize, seq: usize, has_attention: bool) -> usize {
+    let bs = batch * seq;
+    let d_model = config.d_model;
+    let d_inner = config.d_inner();
+    let bc_size = config.n_groups * config.d_state;
+    let theta_proj = config.n_heads * config.d_state / 2;
+    let in_proj_out = d_inner + d_inner + bc_size * 2 + config.n_heads * 3 + theta_proj;
+
+    // Activation-shaped sizes (bs × *) — appear as A in forward and as B in backward
+    // weight-grad accumulations.
+    let mut candidates = vec![
+        bs * d_model,        // x, x_norm, d_x, d_x_norm, d_attn_q/k/v, block_out, …
+        bs * d_inner,        // x_act, z, ssm_out, y_gated, d_y_gated, …
+        bs * in_proj_out,    // projected / d_projected (in_proj weight grad B)
+    ];
+
+    // Weight-shaped sizes (out × in) — appear as B in forward matmuls.
+    candidates.extend_from_slice(&[
+        d_model * in_proj_out,   // in_proj weight
+        d_inner * d_model,       // out_proj weight
+        d_model * d_model,       // attn Q / out_proj weights
+    ]);
+
+    if has_attention {
+        let attn_heads = config.attn_n_heads;
+        let head_dim_attn = d_model / attn_heads;
+        let kv_dim = config.attn_kv_heads * head_dim_attn;
+        let mlp_dim = config.attn_mlp_expand * d_model;
+        candidates.extend_from_slice(&[
+            // weight-shaped
+            d_model * kv_dim,           // k_proj, v_proj
+            d_model * mlp_dim,          // mlp_gate, mlp_up
+            mlp_dim * d_model,          // mlp_down
+            // activation-shaped
+            bs * kv_dim,                // attn_k/v, d_attn_k/v
+            bs * mlp_dim,               // attn_mlp_hidden/gated, d_attn_mlp_*
+            // batched QKᵀ and weights·V shapes
+            batch * attn_heads * seq * seq,
+            batch * attn_heads * seq * head_dim_attn,
+        ]);
+    }
+
+    *candidates.iter().max().unwrap()
 }
 
 // Raw CUDA FFI for memory management

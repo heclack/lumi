@@ -186,6 +186,26 @@ Pure Mamba by default. Set `attention_interval` or `attention_layers` to add GQA
 | `train_data` | "data/train.bin" | Path to training data binary |
 | `val_data` | "data/val.bin" | Path to validation data binary |
 | `seq_len` | 0 | Training sequence length (0 = use `model.max_seq_len`) |
+| `mixed_precision` | false | Use BF16 tensor cores for matmuls. FP32 inputs are converted to BF16 scratch, then `cublasGemmEx` computes in FP32 accumulate. Weights, gradients, and the optimizer stay FP32. Requires sm_80+ (A100/H100/B200). |
+| `bf16_activations` | false | Store per-layer saved activations in BF16 instead of FP32. Roughly halves activation memory, which at Phase-2 shape lifts the batch ceiling from 8 → 16 on an 80 GB A100. Independent from `mixed_precision`: either can be set alone, or combined. Backward converts BF16 saves back to FP32 via staging buffers before each kernel — compute precision is unchanged. |
+
+#### BF16 Memory Modes
+
+The two flags target different things:
+
+- **`mixed_precision=true`** — affects *compute*. Matmuls use BF16 tensor cores (~2× peak throughput on A100 for compute-bound shapes). Adds two small BF16 scratch buffers (~30 MB for Phase-2 shape). No effect on activation memory.
+- **`bf16_activations=true`** — affects *storage*. Per-layer saved tensors that feed backward are stored in BF16, cutting activation memory roughly in half. Small staging buffers in backward convert them back to FP32 on demand. No effect on compute precision.
+
+Tested at Phase-2 shape (96 layers, 970M params, seq=1024) on A100 80 GB:
+
+| mode                  | batch | GPU mem | tok/s |
+|-----------------------|-------|---------|-------|
+| baseline (both false) | 8     | ~65 GB  | 374   |
+| bf16_activations      | 8     | 45 GB   | 371   |
+| bf16_activations      | 16    | 74 GB   | 425   |
+| both enabled          | 16    | 75 GB   | 426   |
+
+Loss trajectories match the FP32-save baseline to ~1e-4 at steady state (verified with same-seed A/B run).
 
 ### Example Configs
 

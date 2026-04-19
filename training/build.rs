@@ -4,9 +4,10 @@ fn main() {
         let mut build = cc::Build::new();
         build.cuda(true);
 
-        // Always target A100 (sm_80) and Ada/RTX 4090 (sm_89)
+        // Always target A100 (sm_80), Ada/RTX 4090 (sm_89), and H100 (sm_90)
         build.flag("-gencode=arch=compute_80,code=sm_80");
         build.flag("-gencode=arch=compute_89,code=sm_89");
+        build.flag("-gencode=arch=compute_90,code=sm_90");
 
         // Blackwell targets require CUDA 12.8+ -- detect nvcc version
         let nvcc_version = std::process::Command::new("nvcc")
