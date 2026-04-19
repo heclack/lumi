@@ -201,11 +201,14 @@ Tested at Phase-2 shape (96 layers, 970M params, seq=1024) on A100 80 GB:
 | mode                  | batch | GPU mem | tok/s |
 |-----------------------|-------|---------|-------|
 | baseline (both false) | 8     | ~65 GB  | 374   |
-| bf16_activations      | 8     | 45 GB   | 371   |
-| bf16_activations      | 16    | 74 GB   | 425   |
-| both enabled          | 16    | 75 GB   | 426   |
+| bf16_activations      | 16    | 62 GB   | 424   |
+| bf16_activations      | 20    | 74 GB   | 420   |
+| bf16_activations      | 22    | 80 GB   | 415   |
+| bf16_activations      | 24    | OOM     | —     |
 
 Loss trajectories match the FP32-save baseline to ~1e-4 at steady state (verified with same-seed A/B run).
+
+Per-layer BF16 storage covers 13 tensors. `x_act = SiLU(x_ssm_raw)` and `y_gated = ssm_out * SiLU(z_buf)` are deliberately NOT saved — backward recomputes them from tensors already in BF16 storage, trading ~12 GB of activation memory at batch=16 for four extra element-wise kernel launches per layer (net throughput impact: < 0.5 %).
 
 ### Example Configs
 

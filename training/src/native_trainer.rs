@@ -827,12 +827,16 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                 }
 
                 // out_proj backward: d_y_gated = d_block_out @ out_proj^T
+                // y_gated is NOT saved — recompute as ssm_out * SiLU(z_buf) in stage_a.
                 unsafe {
                     mm_bt!(mp, buf,
                         buf.d_block_out.ptr, buf.layers[idx].out_proj.ptr, buf.d_y_gated.ptr,
                         bs as i32, d_inner as i32, d_model as i32
                     );
-                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.y_gated.ptr, bs * d_inner);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.ssm_out.ptr, bs * d_inner);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_b.ptr, saved.z_buf.ptr, bs * d_inner);
+                    native_ops::silu_fwd(buf.bwd_stage_b.ptr, buf.bwd_stage_b.ptr, (bs * d_inner) as i32);
+                    native_ops::elemwise_mul(buf.bwd_stage_a.ptr, buf.bwd_stage_b.ptr, buf.bwd_stage_a.ptr, (bs * d_inner) as i32);
                     mm_at_accum!(mp, buf,
                         buf.bwd_stage_a.ptr, buf.d_block_out.ptr, buf.d_layers[idx].d_out_proj,
                         d_inner as i32, d_model as i32, bs as i32
@@ -866,9 +870,11 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                     );
                 }
 
-                // SSM backward — needs 5 saved tensors concurrently (staged a..e)
+                // SSM backward — needs 5 saved tensors concurrently (staged a..e).
+                // x_act is NOT saved — recompute as SiLU(x_ssm_raw) into stage_a.
                 unsafe {
-                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.x_act.ptr,     bs * d_inner);
+                    cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.x_ssm_raw.ptr, bs * d_inner);
+                    native_ops::silu_fwd(buf.bwd_stage_a.ptr, buf.bwd_stage_a.ptr, (bs * d_inner) as i32);
                     cuda_convert_bf16_to_f32(buf.bwd_stage_b.ptr, saved.dt_buf.ptr,    bs * n_heads);
                     cuda_convert_bf16_to_f32(buf.bwd_stage_c.ptr, saved.b_norm.ptr,    bs * bc_size);
                     cuda_convert_bf16_to_f32(buf.bwd_stage_d.ptr, saved.c_norm.ptr,    bs * bc_size);
@@ -2084,10 +2090,11 @@ unsafe fn save_mamba_layer_bf16(
     bs: usize, d_model: usize, d_inner: usize,
     bc_size: usize, n_heads: usize, theta_proj: usize,
 ) {
+    // x_act = SiLU(x_ssm_raw) and y_gated = ssm_out * SiLU(z_buf) are NOT saved —
+    // both are recomputed in backward from tensors already present here.
     cuda_convert_f32_to_bf16(saved.residual.ptr,   buf.residual.ptr,   bs * d_model);
     cuda_convert_f32_to_bf16(saved.x_norm.ptr,     buf.x_norm.ptr,     bs * d_model);
     cuda_convert_f32_to_bf16(saved.x_ssm_raw.ptr,  buf.x_ssm_raw.ptr,  bs * d_inner);
-    cuda_convert_f32_to_bf16(saved.x_act.ptr,      buf.x_act.ptr,      bs * d_inner);
     cuda_convert_f32_to_bf16(saved.z_buf.ptr,      buf.z_buf.ptr,      bs * d_inner);
     cuda_convert_f32_to_bf16(saved.b_raw.ptr,      buf.b_raw.ptr,      bs * bc_size);
     cuda_convert_f32_to_bf16(saved.c_raw.ptr,      buf.c_raw.ptr,      bs * bc_size);
@@ -2098,7 +2105,6 @@ unsafe fn save_mamba_layer_bf16(
     cuda_convert_f32_to_bf16(saved.dd_a_raw.ptr,   buf.dd_a_raw.ptr,   bs * n_heads);
     cuda_convert_f32_to_bf16(saved.theta_raw.ptr,  buf.theta_raw.ptr,  bs * theta_proj);
     cuda_convert_f32_to_bf16(saved.ssm_out.ptr,    buf.ssm_out.ptr,    bs * d_inner);
-    cuda_convert_f32_to_bf16(saved.y_gated.ptr,    buf.y_gated.ptr,    bs * d_inner);
 }
 
 /// Stub for non-CUDA

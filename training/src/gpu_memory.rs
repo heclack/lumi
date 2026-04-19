@@ -157,6 +157,11 @@ pub struct PerLayerSaved {
 }
 
 /// BF16 storage for per-layer Mamba saved activations.
+///
+/// `x_act` and `y_gated` are NOT stored — they are recomputed in backward from
+/// tensors already saved here (`x_act = SiLU(x_ssm_raw)`, `y_gated = ssm_out *
+/// SiLU(z_buf)`) via two extra staging-buffer ops per layer. Trading one memcpy
+/// + one kernel for ~134 MB per layer at bs=16384.
 pub struct PerLayerSavedBf16 {
     pub residual: Bf16Buf,
     pub x_norm: Bf16Buf,
@@ -170,8 +175,6 @@ pub struct PerLayerSavedBf16 {
     pub lambda_raw: Bf16Buf,
     pub dd_a_raw: Bf16Buf,
     pub ssm_out: Bf16Buf,
-    pub y_gated: Bf16Buf,
-    pub x_act: Bf16Buf,
     pub theta_raw: Bf16Buf,
 }
 
@@ -668,8 +671,6 @@ impl TrainingBuffers {
                     lambda_raw: Bf16Buf::alloc(bs * n_heads),
                     dd_a_raw: Bf16Buf::alloc(bs * n_heads),
                     ssm_out: Bf16Buf::alloc(bs * d_inner),
-                    y_gated: Bf16Buf::alloc(bs * d_inner),
-                    x_act: Bf16Buf::alloc(bs * d_inner),
                     theta_raw: Bf16Buf::alloc(bs * theta_proj),
                 });
             } else {
