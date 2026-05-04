@@ -10,33 +10,51 @@ use std::io::{BufRead, BufReader, Write};
 use crate::tokenizer::Tokenizer;
 
 /// Pre-tokenize a text file to binary u32 token format.
+///
+/// Document boundaries are marked by blank lines (one or more empty lines).
+/// Each document gets wrapped with <bos>...<eos> — internal newlines are
+/// preserved so multi-turn dialogues and multi-paragraph narratives train
+/// as single continuous sequences.
 pub fn preprocess(input_path: &str, output_path: &str, tokenizer_path: &str) {
     let tokenizer = Tokenizer::from_file(tokenizer_path);
     let file = fs::File::open(input_path).expect("failed to open input file");
     let reader = BufReader::with_capacity(1 << 20, file);
 
     let mut tokens: Vec<u32> = Vec::new();
-    let mut lines_read = 0u64;
+    let mut current_doc = String::new();
+    let mut docs_written = 0u64;
 
     let bos = tokenizer.token_to_id("<bos>").unwrap_or(1);
     let eos = tokenizer.token_to_id("<eos>").unwrap_or(2);
 
+    let mut flush = |doc: &mut String, tokens: &mut Vec<u32>, docs: &mut u64| {
+        let trimmed = doc.trim();
+        if !trimmed.is_empty() {
+            tokens.push(bos);
+            tokens.extend_from_slice(&tokenizer.encode(trimmed));
+            tokens.push(eos);
+            *docs += 1;
+            if *docs % 50_000 == 0 {
+                eprintln!("  tokenized {}k docs, {} tokens...", *docs / 1000, tokens.len());
+            }
+        }
+        doc.clear();
+    };
+
     for line in reader.lines() {
         let line = line.expect("failed to read line");
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        tokens.push(bos);
-        tokens.extend_from_slice(&tokenizer.encode(line));
-        tokens.push(eos);
-
-        lines_read += 1;
-        if lines_read % 100_000 == 0 {
-            eprintln!("  tokenized {}k lines, {} tokens...", lines_read / 1000, tokens.len());
+        if line.trim().is_empty() {
+            // Blank line → document boundary
+            flush(&mut current_doc, &mut tokens, &mut docs_written);
+        } else {
+            if !current_doc.is_empty() {
+                current_doc.push('\n');
+            }
+            current_doc.push_str(&line);
         }
     }
+    // Flush trailing doc
+    flush(&mut current_doc, &mut tokens, &mut docs_written);
 
     // Write as little-endian u32
     let mut out = fs::File::create(output_path).expect("failed to create output file");
@@ -44,46 +62,59 @@ pub fn preprocess(input_path: &str, output_path: &str, tokenizer_path: &str) {
         out.write_all(&t.to_le_bytes()).expect("failed to write");
     }
 
-    eprintln!("Preprocessed {} lines → {} tokens → {}", lines_read, tokens.len(), output_path);
+    eprintln!("Preprocessed {} docs → {} tokens → {}", docs_written, tokens.len(), output_path);
 }
 
 /// Pre-process a text file to binary u32 using byte-level encoding (no tokenizer).
 /// Each UTF-8 byte maps to ID = byte_value + 3. pad=0, bos=1, eos=2.
+///
+/// Document boundaries are marked by blank lines (same convention as `preprocess`).
 pub fn preprocess_bytes(input_path: &str, output_path: &str) {
     let file = fs::File::open(input_path).expect("failed to open input file");
     let reader = BufReader::with_capacity(1 << 20, file);
 
     let mut tokens: Vec<u32> = Vec::new();
-    let mut lines_read = 0u64;
+    let mut current_doc = String::new();
+    let mut docs_written = 0u64;
 
     let bos: u32 = 1;
     let eos: u32 = 2;
 
+    let mut flush = |doc: &mut String, tokens: &mut Vec<u32>, docs: &mut u64| {
+        let trimmed = doc.trim();
+        if !trimmed.is_empty() {
+            tokens.push(bos);
+            for &byte in trimmed.as_bytes() {
+                tokens.push(byte as u32 + 3);
+            }
+            tokens.push(eos);
+            *docs += 1;
+            if *docs % 50_000 == 0 {
+                eprintln!("  byte-encoded {}k docs, {} tokens...", *docs / 1000, tokens.len());
+            }
+        }
+        doc.clear();
+    };
+
     for line in reader.lines() {
         let line = line.expect("failed to read line");
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        tokens.push(bos);
-        for &byte in line.as_bytes() {
-            tokens.push(byte as u32 + 3);
-        }
-        tokens.push(eos);
-
-        lines_read += 1;
-        if lines_read % 100_000 == 0 {
-            eprintln!("  byte-encoded {}k lines, {} tokens...", lines_read / 1000, tokens.len());
+        if line.trim().is_empty() {
+            flush(&mut current_doc, &mut tokens, &mut docs_written);
+        } else {
+            if !current_doc.is_empty() {
+                current_doc.push('\n');
+            }
+            current_doc.push_str(&line);
         }
     }
+    flush(&mut current_doc, &mut tokens, &mut docs_written);
 
     let mut out = fs::File::create(output_path).expect("failed to create output file");
     for &t in &tokens {
         out.write_all(&t.to_le_bytes()).expect("failed to write");
     }
 
-    eprintln!("Byte-encoded {} lines → {} tokens → {}", lines_read, tokens.len(), output_path);
+    eprintln!("Byte-encoded {} docs → {} tokens → {}", docs_written, tokens.len(), output_path);
 }
 
 /// Binary token dataset for training.
