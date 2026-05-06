@@ -161,47 +161,61 @@ fn load_tensor_bin(path: &str, buf: &mut GpuBuf) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Write a GPU float buffer directly to a BufWriter as little-endian bytes, no intermediate Vec<u8>.
+/// Safety: x86-64 is little-endian, so f32 raw memory layout == LE bytes.
+#[cfg(feature = "cuda")]
+fn write_gpu_floats(writer: &mut std::io::BufWriter<std::fs::File>, floats: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(floats.as_ptr() as *const u8, floats.len() * 4)
+    };
+    writer.write_all(bytes)
+}
+
 /// Save optimizer state (Adam m/v) for resume without momentum loss.
 /// Writes a single concatenated binary: all m states then all v states, in deterministic order.
+/// Streams directly via BufWriter to avoid holding a full second copy of the state in CPU RAM.
 #[cfg(feature = "cuda")]
 pub fn save_optimizer_state(
     buf: &TrainingBuffers,
     dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     let path = format!("{}/optimizer.bin", dir);
-    let mut data: Vec<f32> = Vec::new();
+    let file = std::fs::File::create(&path)?;
+    let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
+    let mut total_floats: usize = 0;
 
     // Mamba large params (in_proj + out_proj) — m then v per layer
     for adam in &buf.adam_m {
-        data.extend_from_slice(&adam.m.to_host());
-        data.extend_from_slice(&adam.v.to_host());
+        let v = adam.m.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = adam.v.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
     }
 
     // Mamba small params — contiguous m_buf and v_buf per layer
     for sa in &buf.small_adam {
-        data.extend_from_slice(&sa.m_buf.to_host());
-        data.extend_from_slice(&sa.v_buf.to_host());
+        let v = sa.m_buf.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = sa.v_buf.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
     }
 
     // Attention Adam state
     for aa in &buf.attn_adam {
-        data.extend_from_slice(&aa.m.to_host());
-        data.extend_from_slice(&aa.v.to_host());
-        data.extend_from_slice(&aa.norm_m.to_host());
-        data.extend_from_slice(&aa.norm_v.to_host());
-        data.extend_from_slice(&aa.mlp_norm_m.to_host());
-        data.extend_from_slice(&aa.mlp_norm_v.to_host());
+        let v = aa.m.to_host();          total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = aa.v.to_host();          total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = aa.norm_m.to_host();     total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = aa.norm_v.to_host();     total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = aa.mlp_norm_m.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+        let v = aa.mlp_norm_v.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
     }
 
     // Global Adam state
-    data.extend_from_slice(&buf.final_norm_adam_m.to_host());
-    data.extend_from_slice(&buf.final_norm_adam_v.to_host());
-    data.extend_from_slice(&buf.embedding_adam_m.to_host());
-    data.extend_from_slice(&buf.embedding_adam_v.to_host());
+    let v = buf.final_norm_adam_m.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+    let v = buf.final_norm_adam_v.to_host(); total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+    let v = buf.embedding_adam_m.to_host();  total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
+    let v = buf.embedding_adam_v.to_host();  total_floats += v.len(); write_gpu_floats(&mut writer, &v)?;
 
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    std::fs::write(&path, bytes)?;
-    eprintln!("  Optimizer state saved: {} ({:.1}MB)", path, data.len() as f64 * 4.0 / 1e6);
+    writer.flush()?;
+    eprintln!("  Optimizer state saved: {} ({:.1}MB)", path, total_floats as f64 * 4.0 / 1e6);
     Ok(())
 }
 

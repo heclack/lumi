@@ -368,10 +368,6 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
     };
     eprintln!("Dataset: {} tokens, {} windows", dataset.tokens.len(), dataset.len());
 
-    let mut rng = {
-        use rand::SeedableRng;
-        rand::rngs::StdRng::seed_from_u64(config.seed)
-    };
     let start_time = std::time::Instant::now();
 
     eprintln!("Starting native training: {} steps, batch={}, seq={}",
@@ -1423,8 +1419,14 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
             if step > 0 && step % config.eval_interval == 0 {
                 let mut val_loss_sum = 0.0f32;
                 let n_val_batches = 10;
+                // Seed from config.seed ^ step so val windows are identical for a given
+                // step regardless of how many times training has been restarted.
+                let mut val_rng = {
+                    use rand::SeedableRng;
+                    rand::rngs::StdRng::seed_from_u64(config.seed ^ step as u64)
+                };
                 for _ in 0..n_val_batches {
-                    let (vi, vt) = get_batch_i32(val_ds, batch, seq, &mut rng);
+                    let (vi, vt) = get_batch_i32(val_ds, batch, seq, &mut val_rng);
                     upload_batch(&buf.input_ids, &buf.target_ids, &vi, &vt);
                     // Forward only (reuses same buffers — no backward)
                     unsafe {
