@@ -4,9 +4,61 @@
 /// Activations reuse buffers across layers (ping-pong pattern).
 
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::ModelConfig;
 
+// ─── Device allocation accounting ────────────────────────────────────────────
+// Every device allocation in this module funnels through GpuBuf/Bf16Buf, so a
+// pair of counters here gives an exact footprint without duplicating the sizing
+// arithmetic (which would drift from the real allocations).
+static GPU_BYTES_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GPU_BYTES_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Device bytes currently held by GpuBuf/Bf16Buf allocations.
+pub fn gpu_bytes_live() -> usize {
+    GPU_BYTES_LIVE.load(Ordering::Relaxed)
+}
+
+/// High-water mark of device bytes held since process start.
+pub fn gpu_bytes_peak() -> usize {
+    GPU_BYTES_PEAK.load(Ordering::Relaxed)
+}
+
+/// Human-readable byte count, e.g. "12.34 GiB".
+pub fn format_bytes(b: usize) -> String {
+    const GIB: f64 = (1usize << 30) as f64;
+    const MIB: f64 = (1usize << 20) as f64;
+    let bf = b as f64;
+    if bf >= GIB {
+        format!("{:.2} GiB", bf / GIB)
+    } else {
+        format!("{:.1} MiB", bf / MIB)
+    }
+}
+
+fn track_alloc(bytes: usize) {
+    let live = GPU_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    GPU_BYTES_PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+fn track_free(bytes: usize) {
+    GPU_BYTES_LIVE.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// Panic with the size that failed and how much was already held. A bare error
+/// code makes an out-of-memory look like a driver fault; this makes it obvious
+/// when the config simply does not fit the card.
+fn alloc_failed(err: i32, bytes: usize, what: &str) -> ! {
+    panic!(
+        "GPU allocation failed ({what}, error {err}): requested {}, already holding {} \
+         across live buffers (peak {}). If this is out-of-memory, reduce batch_size or \
+         seq_len, or enable mixed_precision / bf16_activations.",
+        format_bytes(bytes),
+        format_bytes(gpu_bytes_live()),
+        format_bytes(gpu_bytes_peak()),
+    )
+}
 
 /// GPU buffer — owns a device pointer and knows its size.
 pub struct GpuBuf {
@@ -20,8 +72,11 @@ impl GpuBuf {
         let bytes = n * std::mem::size_of::<f32>();
         unsafe {
             let err = cuda_malloc(&mut ptr as *mut *mut f32 as *mut *mut std::ffi::c_void, bytes);
-            assert!(err == 0, "cudaMalloc failed: {}", err);
+            if err != 0 {
+                alloc_failed(err, bytes, "f32");
+            }
         }
+        track_alloc(bytes);
         Self { ptr, len: n }
     }
 
@@ -79,6 +134,7 @@ impl Drop for GpuBuf {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { cuda_free(self.ptr as *mut std::ffi::c_void); }
+            track_free(self.len * std::mem::size_of::<f32>());
             self.ptr = ptr::null_mut();
         }
     }
@@ -96,8 +152,11 @@ impl Bf16Buf {
         let bytes = n * std::mem::size_of::<u16>();
         unsafe {
             let err = cuda_malloc(&mut ptr as *mut *mut u16 as *mut *mut std::ffi::c_void, bytes);
-            assert!(err == 0, "cudaMalloc (bf16) failed: {}", err);
+            if err != 0 {
+                alloc_failed(err, bytes, "bf16");
+            }
         }
+        track_alloc(bytes);
         Self { ptr, len: n }
     }
 
@@ -111,6 +170,7 @@ impl Drop for Bf16Buf {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { cuda_free(self.ptr as *mut std::ffi::c_void); }
+            track_free(self.len * std::mem::size_of::<u16>());
             self.ptr = ptr::null_mut();
         }
     }
@@ -531,23 +591,14 @@ impl TrainingBuffers {
         let has_attention = config.n_attn_layers() > 0;
         let bwd_stage_size = bs * d_inner;
 
+        // Footprint is reported from the allocation counters after the fact
+        // rather than estimated up front. The previous hand-written estimate
+        // omitted the per-layer saved activations entirely -- the term that
+        // dominates at depth (~85% of per-token cost at 48 layers) -- so it
+        // barely moved when batch or seq changed. `bytes_at_entry` is captured
+        // here and the true total is printed at the end of this function.
         eprintln!("Allocating native GPU training buffers...");
-        let total_mb = (
-            // Activations + gradients (each pair)
-            bs * d_model * 2 * 4 +        // x, d_x
-            bs * d_model * 2 * 2 +        // x_norm, residual, etc
-            bs * in_proj_out * 2 * 2 +    // projected
-            bs * d_inner * 2 * 4 +        // x_act, z, ssm_out, y_gated
-            bs * bc_size * 2 * 2 +        // b_norm, c_norm
-            bs * n_heads * 2 +            // dt
-            bs * vocab * 2 * 2 +          // logits
-            // Weights
-            n_layers * (d_model * in_proj_out + d_inner * d_model + d_model + bc_size * 2 + n_heads * 3) * 2 + // weights + grads
-            vocab * d_model * 2 +         // embedding + grad
-            // Adam state (2x weights)
-            n_layers * (d_model * in_proj_out + d_inner * d_model) * 2 * 2
-        ) * 4 / 1024 / 1024;
-        eprintln!("  Estimated GPU memory: ~{}MB", total_mb);
+        let bytes_at_entry = gpu_bytes_live();
 
         // Allocate activations
         let x = GpuBuf::alloc(bs * d_model);
@@ -800,7 +851,15 @@ impl TrainingBuffers {
         let embedding_adam_m = GpuBuf::alloc(vocab * d_model);
         let embedding_adam_v = GpuBuf::alloc(vocab * d_model);
 
-        eprintln!("  Native GPU buffers allocated.");
+        let held = gpu_bytes_live() - bytes_at_entry;
+        eprintln!(
+            "  Native GPU buffers allocated: {} for {} x {} = {} tokens ({:.1} KiB/token).",
+            format_bytes(held),
+            batch,
+            seq,
+            bs,
+            (held as f64 / bs as f64) / 1024.0,
+        );
 
         Self {
             x, x_norm, projected, x_ssm_raw, x_act, z_buf,
