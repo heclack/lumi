@@ -1,12 +1,12 @@
 /// Native checkpoint save/load — GPU buffers to/from raw binary files.
 /// Export to safetensors for inference via scripts/export_native_safetensors.py.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::gpu_memory::{TrainingBuffers, GpuBuf};
 
 /// Save model weights from GPU to checkpoint directory.
 /// `meta` is the complete metadata JSON — caller provides all fields (step, loss, epoch, etc.).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn save_native_checkpoint(
     buf: &TrainingBuffers,
     dir: &str,
@@ -83,7 +83,7 @@ pub fn save_native_checkpoint(
 }
 
 /// Load model weights from checkpoint into GPU buffers. Returns step number.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn load_native_checkpoint(
     buf: &mut TrainingBuffers,
     dir: &str,
@@ -136,7 +136,7 @@ pub fn load_native_checkpoint(
     Ok(step)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn load_tensor_bin(path: &str, buf: &mut GpuBuf) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let data: Vec<f32> = bytes.chunks_exact(4)
@@ -163,7 +163,7 @@ fn load_tensor_bin(path: &str, buf: &mut GpuBuf) -> Result<(), Box<dyn std::erro
 
 /// Write a GPU float buffer directly to a BufWriter as little-endian bytes, no intermediate Vec<u8>.
 /// Safety: x86-64 is little-endian, so f32 raw memory layout == LE bytes.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn write_gpu_floats(writer: &mut std::io::BufWriter<std::fs::File>, floats: &[f32]) -> std::io::Result<()> {
     use std::io::Write;
     let bytes = unsafe {
@@ -175,7 +175,7 @@ fn write_gpu_floats(writer: &mut std::io::BufWriter<std::fs::File>, floats: &[f3
 /// Save optimizer state (Adam m/v) for resume without momentum loss.
 /// Writes a single concatenated binary: all m states then all v states, in deterministic order.
 /// Streams directly via BufWriter to avoid holding a full second copy of the state in CPU RAM.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn save_optimizer_state(
     buf: &TrainingBuffers,
     dir: &str,
@@ -220,7 +220,7 @@ pub fn save_optimizer_state(
 }
 
 /// Load optimizer state from checkpoint. Skips if file doesn't exist (fresh training start).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn load_optimizer_state(
     buf: &mut TrainingBuffers,
     dir: &str,
@@ -278,10 +278,10 @@ pub fn load_optimizer_state(
 }
 
 // Stubs for non-CUDA builds (never called, but must exist for module to compile)
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 #[allow(dead_code)]
 pub fn save_native_checkpoint(
     _buf: &(), _dir: &str, _meta: serde_json::Value, _config: &crate::config::ModelConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    panic!("Native checkpoints require --features cuda")
+    panic!("Native checkpoints require a GPU backend: --features hip (AMD) or --features cuda (NVIDIA)")
 }

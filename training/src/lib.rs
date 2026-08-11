@@ -3,7 +3,7 @@ pub mod data;
 pub mod tokenizer;
 pub mod native_trainer;
 pub mod native_ops;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod gpu_memory;
 pub mod native_checkpoint;
 pub mod checkpoint;

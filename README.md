@@ -11,12 +11,13 @@ Cargo workspace containing both the training and inference crates for Lumi, a Ma
 ```
 model/
 ├── Cargo.toml        # Workspace manifest
-├── training/         # CUDA training binary: lumi
+├── training/         # GPU training binary: lumi
 │   ├── src/          # Rust training code (~6.5K lines)
-│   ├── csrc/         # Custom CUDA kernels (~3.7K lines)
+│   ├── csrc_hip/     # AMD/ROCm kernels — active target (gfx1201 / RDNA4)
+│   ├── csrc_cuda/    # Original NVIDIA kernels — retained for reference
 │   ├── tests/        # 60 unit tests
-│   ├── build.rs      # CUDA kernel compilation
-│   └── Dockerfile    # RunPod deployment
+│   ├── build.rs      # Kernel compilation (--features hip | cuda)
+│   └── Dockerfile    # RunPod deployment (NVIDIA path)
 ├── inference/        # Metal inference binary: lumi-infer
 │   └── src/          # Candle + Metal code (~3.6K lines + Metal shaders)
 └── scripts/          # Shared tooling

@@ -90,7 +90,10 @@ fn preprocess_bytes_roundtrip() {
     let input_path = dir.path().join("input.txt");
     let output_path = dir.path().join("output.bin");
 
-    std::fs::write(&input_path, "Hello\nWorld\n").unwrap();
+    // Blank line between the two words: document boundaries are blank lines, not
+    // newlines (see preprocess_bytes docs). A bare "Hello\nWorld\n" is a *single*
+    // document whose text contains a newline.
+    std::fs::write(&input_path, "Hello\n\nWorld\n").unwrap();
     preprocess_bytes(input_path.to_str().unwrap(), output_path.to_str().unwrap());
 
     let bytes = std::fs::read(&output_path).unwrap();
@@ -100,7 +103,7 @@ fn preprocess_bytes_roundtrip() {
 
     // "Hello" = [72, 101, 108, 108, 111] + 3 = [75, 104, 111, 111, 114]
     // "World" = [87, 111, 114, 108, 100] + 3 = [90, 114, 117, 111, 103]
-    // With bos=1, eos=2 wrapping each line
+    // With bos=1, eos=2 wrapping each document
     assert_eq!(tokens[0], 1); // bos
     assert_eq!(tokens[1], b'H' as u32 + 3);
     assert_eq!(tokens[2], b'e' as u32 + 3);
@@ -112,7 +115,30 @@ fn preprocess_bytes_roundtrip() {
     assert_eq!(tokens[8], b'W' as u32 + 3);
     assert_eq!(tokens[12], b'd' as u32 + 3);
     assert_eq!(tokens[13], 2); // eos
-    assert_eq!(tokens.len(), 14); // 2 * (1 + 5 + 1)
+    assert_eq!(tokens.len(), 14); // 2 docs * (bos + 5 bytes + eos)
+}
+
+#[test]
+fn preprocess_bytes_keeps_newlines_inside_a_document() {
+    // The complement of the test above: consecutive non-blank lines form ONE
+    // document, with the newline preserved as a byte rather than becoming a
+    // boundary. Pins the convention that preprocess_bytes_roundtrip got wrong.
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("input.txt");
+    let output_path = dir.path().join("output.bin");
+
+    std::fs::write(&input_path, "Hello\nWorld\n").unwrap();
+    preprocess_bytes(input_path.to_str().unwrap(), output_path.to_str().unwrap());
+
+    let bytes = std::fs::read(&output_path).unwrap();
+    let tokens: Vec<u32> = bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    assert_eq!(tokens.len(), 13); // bos + "Hello\nWorld" (11 bytes) + eos
+    assert_eq!(tokens[0], 1); // bos
+    assert_eq!(tokens[6], b'\n' as u32 + 3); // newline is data, not a boundary
+    assert_eq!(tokens[12], 2); // single eos at the very end
 }
 
 #[test]

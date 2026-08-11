@@ -3,17 +3,17 @@
 /// All operations run on GPU via cuBLAS + custom CUDA kernels.
 /// Zero CPU-GPU transfers during training (except loss logging).
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::config::TrainingConfig;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::gpu_memory::{TrainingBuffers, GpuBuf, LayerWeights};
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::native_ops;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::data::TokenDataset;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn chrono_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -22,7 +22,7 @@ fn chrono_timestamp() -> String {
 
 /// Mixed-precision dispatch macros. When `mp` is true, uses BF16 tensor-core matmuls
 /// (FP32 inputs → BF16 scratch → cublasGemmEx → FP32 output). When false, uses FP32 TF32.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
         if $mp {
@@ -32,7 +32,7 @@ macro_rules! mm {
         }
     };
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm_bt {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
         if $mp {
@@ -42,7 +42,7 @@ macro_rules! mm_bt {
         }
     };
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm_at_accum {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr) => {
         if $mp {
@@ -52,7 +52,7 @@ macro_rules! mm_at_accum {
         }
     };
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm_batched {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
         if $mp {
@@ -62,7 +62,7 @@ macro_rules! mm_batched {
         }
     };
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm_bt_batched {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
         if $mp {
@@ -72,7 +72,7 @@ macro_rules! mm_bt_batched {
         }
     };
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! mm_at_batched {
     ($mp:expr, $buf:expr, $A:expr, $B:expr, $C:expr, $m:expr, $n:expr, $k:expr, $batch:expr) => {
         if $mp {
@@ -85,7 +85,7 @@ macro_rules! mm_at_batched {
 
 /// Destination pointers for Mamba block intermediate values.
 /// Training points these to per-layer saved buffers; validation points to scratch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 struct MambaForwardDst {
     residual: *mut f32,
     x_norm: *mut f32,
@@ -106,7 +106,7 @@ struct MambaForwardDst {
 
 /// Shared attention block forward pass. Used by both training and validation.
 /// When `save` is Some, copies intermediates for backward. When None, inference-only.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn attention_block_forward(
     x: *mut f32,
     buf: &TrainingBuffers,
@@ -194,7 +194,7 @@ unsafe fn attention_block_forward(
 }
 
 /// Shared Mamba block forward pass. Used by both training and validation.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn mamba_block_forward(
     x: *mut f32,
     projected: *mut f32,
@@ -265,22 +265,21 @@ unsafe fn mamba_block_forward(
     native_ops::elemwise_add(block_out, dst.residual, x, bs * d_model);
 }
 
-/// Run native CUDA training.
-#[cfg(feature = "cuda")]
+/// Run native GPU training.
+#[cfg(feature = "gpu")]
 pub fn train_native(config: &TrainingConfig, device_id: i32) {
-    eprintln!("=== Lumi — Native CUDA Training ===");
-    eprintln!("Pure cuBLAS + custom CUDA kernels");
+    eprintln!("=== Lumi — Native {} Training ===", native_ops::BACKEND);
+    eprintln!("Pure {} + custom {} kernels", native_ops::BLAS_NAME, native_ops::BACKEND);
 
-    // Initialize CUDA device + cuBLAS
+    // Initialize GPU device + BLAS
     unsafe {
-        // Set CUDA device
         let err = cuda_set_device(device_id);
         if err != 0 {
-            panic!("cudaSetDevice({}) failed: {}", device_id, err);
+            panic!("set_device({}) failed: {}", device_id, err);
         }
-        eprintln!("CUDA device {} initialized", device_id);
+        eprintln!("{} device {} initialized", native_ops::BACKEND, device_id);
         native_ops::cublas_init();
-        eprintln!("cuBLAS initialized");
+        eprintln!("{} initialized", native_ops::BLAS_NAME);
     }
 
     let batch = config.batch_size;
@@ -570,7 +569,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
             // error encountered since the last check — abort on non-zero.
             let sync_status = unsafe { native_ops::cudaDeviceSynchronize() };
             if sync_status != 0 {
-                panic!("CUDA error at forward/backward boundary: {}", sync_status);
+                panic!("{} error at forward/backward boundary: {}", native_ops::BACKEND, sync_status);
             }
             eprintln!("  Forward pass complete ({:.1}s)", start_time.elapsed().as_secs_f32());
         }
@@ -1545,7 +1544,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 }
 
 /// Smoke test: allocate small buffers, run one forward pass, check each kernel.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn smoke_test_forward(config: &TrainingConfig) {
     use crate::gpu_memory::GpuBuf;
     use crate::native_ops;
@@ -1560,11 +1559,11 @@ pub fn smoke_test_forward(config: &TrainingConfig) {
     let head_dim = d_inner / n_heads;
     let bs = batch * seq;
 
-    eprintln!("=== CUDA Smoke Test — batch={}, seq={} ===", batch, seq);
+    eprintln!("=== {} Smoke Test — batch={}, seq={} ===", native_ops::BACKEND, batch, seq);
     eprintln!("Model: d_model={}, n_layers={}, n_heads={}, d_state={}", d_model, config.model.n_layers, n_heads, d_state);
 
-    // Init CUDA
-    eprintln!("[1/8] cuBLAS init...");
+    // Init BLAS
+    eprintln!("[1/8] {} init...", native_ops::BLAS_NAME);
     unsafe { native_ops::cublas_init(); }
     eprintln!("  OK");
 
@@ -1576,7 +1575,7 @@ pub fn smoke_test_forward(config: &TrainingConfig) {
     eprintln!("  OK");
 
     // Test matmul
-    eprintln!("[3/8] cuBLAS matmul ({} x {})...", bs, d_inner);
+    eprintln!("[3/8] {} matmul ({} x {})...", native_ops::BLAS_NAME, bs, d_inner);
     unsafe {
         native_ops::matmul_f32(x.ptr, w.ptr, out.ptr, bs as i32, d_inner as i32, d_model as i32);
         native_ops::cudaDeviceSynchronize();
@@ -1676,7 +1675,7 @@ pub fn smoke_test_forward(config: &TrainingConfig) {
 /// Extended smoke test: full forward pass for every config branch.
 /// Tests pure Mamba, hybrid (interval + explicit), windowed attention,
 /// and byte-level vocab — all with small dimensions on GPU.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn smoke_test_configs() {
     use crate::config::{ModelConfig, TrainingConfig};
     use crate::gpu_memory::{GpuBuf, LayerType};
@@ -1719,7 +1718,7 @@ pub fn smoke_test_configs() {
         ("byte_level", ModelConfig { byte_level: true, vocab_size: 259, ..base.clone() }),
     ];
 
-    eprintln!("=== Extended CUDA Smoke Test — {} config variants ===\n", configs.len());
+    eprintln!("=== Extended {} Smoke Test — {} config variants ===\n", native_ops::BACKEND, configs.len());
     unsafe { native_ops::cublas_init(); }
 
     let mut pass_count = 0;
@@ -1867,7 +1866,7 @@ pub fn smoke_test_configs() {
 /// Initialize weights for training from scratch.
 /// Embedding uses random init (breaks token symmetry). Projections use a single
 /// pre-generated random buffer sliced per layer (fast). Small params use constants.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn init_weights_random(buf: &mut TrainingBuffers, config: &TrainingConfig) {
     use rand::Rng;
     use rand::SeedableRng;
@@ -1994,7 +1993,7 @@ fn init_weights_random(buf: &mut TrainingBuffers, config: &TrainingConfig) {
 }
 
 /// Get a batch as i32 token IDs (for GPU embedding lookup).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn get_batch_i32(dataset: &TokenDataset, batch: usize, seq: usize, rng: &mut impl rand::Rng) -> (Vec<i32>, Vec<i32>) {
     let max_idx = dataset.len();
     let mut inputs = Vec::with_capacity(batch * seq);
@@ -2013,7 +2012,7 @@ fn get_batch_i32(dataset: &TokenDataset, batch: usize, seq: usize, rng: &mut imp
 
 /// Get a batch using sequential coprime-stride sampling.
 /// Guarantees every window is visited exactly once per epoch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn get_batch_sequential(
     dataset: &TokenDataset, batch: usize, seq: usize,
     stride: usize, pos: &mut usize, epoch: &mut usize,
@@ -2040,7 +2039,7 @@ fn get_batch_sequential(
 }
 
 /// Upload token IDs to GPU.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn upload_batch(input_buf: &GpuBuf, target_buf: &GpuBuf, inputs: &[i32], targets: &[i32]) {
     unsafe {
         cuda_memcpy_h2d(input_buf.ptr as *mut std::ffi::c_void,
@@ -2052,40 +2051,51 @@ fn upload_batch(input_buf: &GpuBuf, target_buf: &GpuBuf, inputs: &[i32], targets
     }
 }
 
-#[cfg(feature = "cuda")]
+// See gpu_memory.rs: CUDA and HIP agree on both the signatures and the memcpy
+// `kind` values (H2D=1, D2H=2, D2D=3), so only the symbol names differ.
+#[cfg(all(feature = "cuda", not(feature = "hip")))]
 extern "C" {
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
                   count: usize, kind: i32) -> i32;
     fn cudaSetDevice(device: i32) -> i32;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "hip")]
+extern "C" {
+    #[link_name = "hipMemcpy"]
+    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                  count: usize, kind: i32) -> i32;
+    #[link_name = "hipSetDevice"]
+    fn cudaSetDevice(device: i32) -> i32;
+}
+
+#[cfg(feature = "gpu")]
 unsafe fn cuda_set_device(device: i32) -> i32 { cudaSetDevice(device) }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn cuda_memcpy_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) {
     cudaMemcpy(dst, src, bytes, 1); // cudaMemcpyHostToDevice
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn cuda_memcpy_d2d(dst: *mut f32, src: *const f32, n: usize) {
     cudaMemcpy(dst as *mut std::ffi::c_void, src as *const std::ffi::c_void,
                n * 4, 3); // cudaMemcpyDeviceToDevice
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn cuda_convert_f32_to_bf16(dst: *mut u16, src: *const f32, n: usize) {
     native_ops::convert_f32_to_bf16(src, dst, n as i32);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn cuda_convert_bf16_to_f32(dst: *mut f32, src: *const u16, n: usize) {
     native_ops::convert_bf16_to_f32(src, dst, n as i32);
 }
 
 /// Copy live FP32 forward scratch into BF16 per-layer storage.
 /// Only called in the bf16_activations path after a Mamba forward into shared scratch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe fn save_mamba_layer_bf16(
     buf: &TrainingBuffers,
     saved: &crate::gpu_memory::PerLayerSavedBf16,
@@ -2110,7 +2120,7 @@ unsafe fn save_mamba_layer_bf16(
 }
 
 /// Stub for non-CUDA
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn train_native(_config: &crate::config::TrainingConfig, _device_id: i32) {
-    panic!("Native training requires --features cuda");
+    panic!("Native training requires a GPU backend: --features hip (AMD) or --features cuda (NVIDIA)");
 }

@@ -3,8 +3,8 @@
 /// Subcommands:
 ///   train-tokenizer  Train a BPE tokenizer on corpus
 ///   preprocess        Tokenize corpus to binary format
-///   train             Train the model (native CUDA)
-///   smoke-test        Verify CUDA kernels
+///   train             Train the model (native GPU: HIP or CUDA)
+///   smoke-test        Verify GPU kernels
 ///
 /// For evaluation and text generation, use the inference binary: lumi-infer
 
@@ -46,16 +46,16 @@ enum Command {
         #[arg(long)]
         byte_level: bool,
     },
-    /// Train the model (native CUDA).
+    /// Train the model (native GPU).
     Train {
         /// Config JSON path (optional, uses defaults if not provided).
         #[arg(short, long)]
         config: Option<String>,
-        /// CUDA device ID.
+        /// GPU device ID.
         #[arg(short = 'd', long, default_value = "0")]
         device: i32,
     },
-    /// Smoke test CUDA kernels (forward pass).
+    /// Smoke test GPU kernels (forward pass).
     SmokeTest {
         /// Config JSON path (optional).
         #[arg(short, long)]
@@ -89,12 +89,12 @@ fn main() {
                 None => lumi::config::TrainingConfig::default(),
             };
 
-            eprintln!("=== Lumi — Native CUDA Training — Mamba-3 {}M ===",
-                config.model.param_count() / 1_000_000);
+            eprintln!("=== Lumi — Native {} Training — Mamba-3 {}M ===",
+                lumi::native_ops::BACKEND, config.model.param_count() / 1_000_000);
             lumi::native_trainer::train_native(&config, device);
         }
         Command::SmokeTest { config: config_path, all_configs } => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             {
                 if all_configs {
                     lumi::native_trainer::smoke_test_configs();
@@ -107,11 +107,11 @@ fn main() {
                     lumi::native_trainer::smoke_test_forward(&config);
                 }
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             {
                 let _ = config_path;
                 let _ = all_configs;
-                eprintln!("smoke-test requires --features cuda");
+                eprintln!("smoke-test requires a GPU backend: --features hip (AMD) or --features cuda (NVIDIA)");
             }
         }
     }

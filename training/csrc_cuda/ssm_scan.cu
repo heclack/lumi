@@ -334,7 +334,10 @@ __global__ void ssm_scan_bwd_kernel(
     // Per-thread DD-RoPE state (tid < half_d_state only)
     float my_cum_angle_saved[CHUNK_SIZE];   // cumulative rotation angle at each timestep within a chunk
     float my_dt_pos_saved[CHUNK_SIZE];      // per-timestep dt_pos for theta gradient chain rule
-    float my_theta_val = 0.0f;     // tanh-bounded theta * pi
+    // Per-timestep tanh-bounded theta * pi. MUST be saved per timestep like the
+    // two above: the reverse-time loop needs theta at its own t, and a scalar
+    // here would leave every step using the chunk's LAST theta.
+    float my_theta_saved[CHUNK_SIZE];
     float d_angle_accum = 0.0f;    // reverse-cumsum of d_angle for backprop
 
     // Per-thread state arrays (must match forward kernel's h[16])
@@ -453,10 +456,11 @@ __global__ void ssm_scan_bwd_kernel(
                 bwd_cum_angle[k] = fmodf(bwd_cum_angle[k] + dt_pos * tv, TWO_PI);
             }
             if (tid < half_d_state) {
-                my_theta_val = tanhf(theta[batch_idx * theta_batch_stride_bwd + t * theta_seq_stride_bwd + theta_head_offset_bwd + tid]) * 3.14159265f;
+                float my_theta_val = tanhf(theta[batch_idx * theta_batch_stride_bwd + t * theta_seq_stride_bwd + theta_head_offset_bwd + tid]) * 3.14159265f;
                 my_chunk_cum_angle = fmodf(my_chunk_cum_angle + dt_pos * my_theta_val, TWO_PI);
                 my_cum_angle_saved[local_t] = my_chunk_cum_angle;
                 my_dt_pos_saved[local_t] = dt_pos;
+                my_theta_saved[local_t] = my_theta_val;
             }
             // Load B into shared and rotate
             int bc_base_t = batch_idx * b_batch_stride + t * b_seq_stride + b_group_offset;
@@ -657,9 +661,10 @@ __global__ void ssm_scan_bwd_kernel(
 
                     // DD-RoPE contribution to d_dt_pos: cum_angle[k] += dt_pos * theta_val[k]
                     // so d_dt_pos += sum_k(d_cum_angle[k] * theta_val[k])
-                    // d_angle_accum IS d_cum_angle[k], my_theta_val IS tanh(theta_raw)*pi
+                    // d_angle_accum IS d_cum_angle[k], my_theta_saved[local_t] IS
+                    // tanh(theta_raw[t])*pi for THIS timestep (not the chunk's last).
                     // Warp-shuffle reduce across tid 0..half_d_state-1 (fits in one warp)
-                    float d_dt_from_rope = d_angle_accum * my_theta_val;
+                    float d_dt_from_rope = d_angle_accum * my_theta_saved[local_t];
                     for (int offset = 16; offset > 0; offset >>= 1)
                         d_dt_from_rope += __shfl_xor_sync(0xffffffff, d_dt_from_rope, offset);
                     if (tid == 0) {
@@ -822,6 +827,20 @@ void ssm_scan_bwd_gpu_v2(
     int batch, int seq, int n_heads, int head_dim, int d_state, int n_groups,
     int chunk_size
 ) {
+    // The DD-RoPE theta reduction inside the backward kernel runs under
+    // `if (tid < half_d_state)` and then reduces with a full 32-lane warp mask.
+    // That is only correct when half_d_state == 32 exactly. With a smaller
+    // d_state the mask names lanes that are not active: NVIDIA silently reduces
+    // undefined lane values, and HIP traps (HSA_STATUS_ERROR_EXCEPTION) because
+    // __hip_check_mask asserts mask == __ballot(true). With a larger d_state the
+    // 32-lane reduction would simply miss contributions. Fail loudly instead.
+    if (d_state != 64) {
+        fprintf(stderr,
+            "ERROR: ssm_scan_bwd requires d_state == 64 (got %d); the DD-RoPE "
+            "theta reduction assumes d_state/2 == warp width.\n", d_state);
+        return;
+    }
+
     int n_blocks = batch * n_heads;
     int n_threads = 256;
     // DD-RoPE always on: head_dim (dx accum) + 4*d_state + d_state/2 + 2*head_dim (x/dy cache)

@@ -1,12 +1,43 @@
-// FFI bindings for all native CUDA kernels: cuBLAS, element-wise, AdamW.
+// FFI bindings for all native GPU kernels: BLAS, element-wise, AdamW.
 // These bypass Burn entirely — raw GPU pointer operations.
+//
+// The kernel symbols below are backend-agnostic: csrc_cuda/ (CUDA) and
+// csrc_hip/ (HIP) export the same names, so only the runtime's own entry point
+// differs.
 
-#[cfg(feature = "cuda")]
+/// Names of the compiled-in backend, for log messages. Keeps user-facing output
+/// honest about which stack is actually running.
+#[cfg(feature = "hip")]
+pub const BACKEND: &str = "HIP/ROCm";
+#[cfg(feature = "hip")]
+pub const BLAS_NAME: &str = "hipBLAS";
+
+#[cfg(all(feature = "cuda", not(feature = "hip")))]
+pub const BACKEND: &str = "CUDA";
+#[cfg(all(feature = "cuda", not(feature = "hip")))]
+pub const BLAS_NAME: &str = "cuBLAS";
+
+// Defined unconditionally so callers outside a `gpu` cfg can name the backend.
+#[cfg(not(feature = "gpu"))]
+pub const BACKEND: &str = "no-GPU";
+#[cfg(not(feature = "gpu"))]
+pub const BLAS_NAME: &str = "no-BLAS";
+
+// ─── GPU runtime (name differs per backend, signature does not) ───
+#[cfg(all(feature = "cuda", not(feature = "hip")))]
 extern "C" {
-    // ─── CUDA runtime ───
     pub fn cudaDeviceSynchronize() -> i32;
+}
 
-    // ─── cuBLAS ───
+#[cfg(feature = "hip")]
+extern "C" {
+    #[link_name = "hipDeviceSynchronize"]
+    pub fn cudaDeviceSynchronize() -> i32;
+}
+
+#[cfg(feature = "gpu")]
+extern "C" {
+    // ─── BLAS ───
     pub fn cublas_init();
     pub fn cublas_destroy();
 
@@ -213,9 +244,9 @@ extern "C" {
 }
 
 // Stubs for non-CUDA builds
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 #[allow(dead_code)]
-pub unsafe fn cublas_init() { panic!("CUDA not available") }
-#[cfg(not(feature = "cuda"))]
+pub unsafe fn cublas_init() { panic!("No GPU backend compiled in; build with --features hip or --features cuda") }
+#[cfg(not(feature = "gpu"))]
 #[allow(dead_code)]
-pub unsafe fn cublas_destroy() { panic!("CUDA not available") }
+pub unsafe fn cublas_destroy() { panic!("No GPU backend compiled in; build with --features hip or --features cuda") }

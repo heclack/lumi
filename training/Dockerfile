@@ -2,6 +2,9 @@
 #
 # Build: docker build -t lumi .
 # Run:   docker run --gpus all lumi train
+#
+# NOTE: this is the NVIDIA path, built from csrc_cuda/. The active local target
+# is AMD/ROCm (csrc_hip/, --features hip); there is no ROCm Dockerfile yet.
 
 # ---- Builder stage: CUDA toolkit + Rust ----
 FROM nvidia/cuda:12.6.0-devel-ubuntu24.04 AS builder
@@ -20,7 +23,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
-COPY csrc/ csrc/
+COPY csrc_cuda/ csrc_cuda/
 
 RUN cargo build --release --features cuda
 

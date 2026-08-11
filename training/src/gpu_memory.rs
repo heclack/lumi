@@ -893,12 +893,31 @@ fn bf16_scratch_size(config: &ModelConfig, batch: usize, seq: usize, has_attenti
     *candidates.iter().max().unwrap()
 }
 
-// Raw CUDA FFI for memory management
+// Raw GPU-runtime FFI for memory management.
+//
+// CUDA and HIP expose the same four entry points with identical signatures, and
+// the memcpy `kind` enum shares its numeric values across both (HostToDevice=1,
+// DeviceToHost=2), so only the symbol names differ. `link_name` absorbs that
+// difference and every call site below stays backend-agnostic.
+#[cfg(all(feature = "cuda", not(feature = "hip")))]
 extern "C" {
     fn cudaMalloc(devPtr: *mut *mut std::ffi::c_void, size: usize) -> i32;
     fn cudaFree(devPtr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
                   count: usize, kind: i32) -> i32;
+    fn cudaMemset(devPtr: *mut std::ffi::c_void, value: i32, count: usize) -> i32;
+}
+
+#[cfg(feature = "hip")]
+extern "C" {
+    #[link_name = "hipMalloc"]
+    fn cudaMalloc(devPtr: *mut *mut std::ffi::c_void, size: usize) -> i32;
+    #[link_name = "hipFree"]
+    fn cudaFree(devPtr: *mut std::ffi::c_void) -> i32;
+    #[link_name = "hipMemcpy"]
+    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                  count: usize, kind: i32) -> i32;
+    #[link_name = "hipMemset"]
     fn cudaMemset(devPtr: *mut std::ffi::c_void, value: i32, count: usize) -> i32;
 }
 

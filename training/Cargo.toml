@@ -7,7 +7,11 @@ description = "Lumi — a hybrid Mamba-3 language model trainer and inference"
 [features]
 default = ["cpu"]
 cpu = []
-cuda = []
+# Umbrella for "a GPU backend is compiled in". All GPU-side Rust is gated on
+# this, so backend selection is confined to build.rs and the runtime FFI names.
+gpu = []
+cuda = ["gpu"] # NVIDIA backend, kernels from csrc_cuda/ (retained, not active)
+hip = ["gpu"]  # AMD/ROCm backend, kernels from csrc_hip/
 
 [dependencies]
 tokenizers = "0.20"
