@@ -168,8 +168,11 @@ __global__ void ssm_ssd_fwd_kernel(
                 float tv = tanhf(theta[batch_idx * theta_batch_stride + t * theta_seq_stride + theta_head_offset + k]) * 3.14159265f;
                 cum_angle_sh[k] = fmodf(cum_angle_sh[k] + dt_pos * tv, TWO_PI);
             }
-            __syncthreads();
         }
+        // Unconditional barrier: publishes cum_angle_sh AND separates the previous
+        // iteration's x_cache reads (output loop) from the overwrite below. With
+        // theta == nullptr the old in-if barrier was skipped, leaving that race.
+        __syncthreads();
 
         // Cache x and B
         for (int p = tid; p < head_dim; p += n_threads)
@@ -198,6 +201,11 @@ __global__ void ssm_ssd_fwd_kernel(
             prev_bx[local_i] = bx;
             local_i++;
         }
+        // Barrier before bc_cache is overwritten with C and x_cache is zeroed:
+        // without it, a fast warp clobbers both while slower warps are still
+        // reading B/x above — a cross-warp race that produced nondeterministic
+        // output under concurrent GPU load (up to ~77% error at some elements).
+        __syncthreads();
 
         // Load C, zero x_cache for y reduction
         for (int s = tid; s < d_state; s += n_threads)
