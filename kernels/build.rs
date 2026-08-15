@@ -22,6 +22,7 @@ fn main() {
             .flag("-O3")
             .flag("-ffast-math") // was --use_fast_math; HW intrinsics for exp/log/sigmoid
             .file("csrc_hip/ssm_scan.cu")
+            .file("csrc_hip/ssm_step.cu")
             .file("csrc_hip/elementwise_ops.cu")
             .file("csrc_hip/cublas_ops.cu")
             .compile("nm_kernels");
