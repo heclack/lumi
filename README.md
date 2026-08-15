@@ -9,19 +9,29 @@ This is a work in progress, this project was originally created to accomplish 2 
 Cargo workspace containing both the training and inference crates for Lumi, a Mamba-3 language model.
 
 ```
-model/
-├── Cargo.toml        # Workspace manifest
-├── training/         # GPU training binary: lumi
-│   ├── src/          # Rust training code (~6.5K lines)
-│   ├── csrc_hip/     # AMD/ROCm kernels — active target (gfx1201 / RDNA4)
-│   ├── csrc_cuda/    # Original NVIDIA kernels — retained for reference
-│   ├── tests/        # 60 unit tests
-│   ├── build.rs      # Kernel compilation (--features hip | cuda)
-│   └── Dockerfile    # RunPod deployment (NVIDIA path)
-├── inference/        # Metal inference binary: lumi-infer
-│   └── src/          # Candle + Metal code (~3.6K lines + Metal shaders)
-└── scripts/          # Shared tooling
-    └── export_native_safetensors.py  # Convert checkpoint → safetensors
+lil-mamba-3/
+├── Cargo.toml                       # Workspace manifest
+├── kernels/                         # Shared GPU kernel crate: lumi-kernels
+│   ├── src/
+│   │   ├── buf.rs                   # GpuBuf device buffer management
+│   │   └── ops.rs                   # FFI exports to training + inference
+│   ├── csrc_hip/                    # AMD/ROCm kernels — active target (gfx1201 / RDNA4)
+│   ├── csrc_cuda/                   # Original NVIDIA kernels — retained for reference
+│   ├── build.rs                     # Kernel compilation (--features hip | cuda)
+│   └── tests/                       # Kernel unit tests
+├── training/                        # GPU training binary: lumi
+│   ├── src/                         # Rust training code (~6.5K lines)
+│   ├── tests/                       # 60 unit tests
+│   ├── Cargo.toml                   # depends on lumi-kernels
+│   └── Dockerfile                   # RunPod deployment (NVIDIA path)
+├── inference/                       # Native HIP inference binary: lumi-infer
+│   ├── src/                         # HIP host layer + model forward pass
+│   ├── Cargo.toml                   # depends on lumi-kernels with hip feature
+│   └── METAL_TO_HIP.md              # Porting guide from Candle+Metal
+├── archive/
+│   └── metal-inference/             # Retired Candle+Metal implementation (reference only)
+└── scripts/                         # Shared tooling
+    └── export_native_safetensors.py # Convert checkpoint → safetensors
 ```
 
 ## Architecture
@@ -43,14 +53,14 @@ Mamba-3 selective state space model with these key features:
 
 ## Training
 
-Requires NVIDIA GPU with CUDA 12+ and Rust toolchain.
+Requires AMD GPU with HIP/ROCm (active target: gfx1201/RDNA4) or NVIDIA GPU with CUDA 12+, plus Rust toolchain.
 
 ```bash
-# Build (from model/training/ or via workspace)
-cargo build --release -p lumi --features cuda
+# Build with HIP (AMD, active target)
+cargo build --release -p lumi --features hip
 
-# Or from the training directory:
-cd training && cargo build --release --features cuda
+# Or with CUDA (NVIDIA, retained for reference)
+cargo build --release -p lumi --features cuda
 ```
 
 ### Subcommands
@@ -81,25 +91,25 @@ cargo test -p lumi    # 60 tests, CPU only (no CUDA required)
 
 ## Inference
 
-Runs on Apple Silicon (Metal) or CPU fallback. See [inference/README.md](inference/README.md) for full details.
+Native HIP implementation for AMD Radeon AI PRO R9700 (gfx1201). See [inference/README.md](inference/README.md) for full details. The retired Candle+Metal implementation for Apple Silicon is preserved at [archive/metal-inference/](archive/metal-inference/).
 
 ```bash
 # Build
-cargo build --release -p lumi-inference
+cargo build --release -p lumi-infer --features hip
 
 # Export checkpoint
-python3 ../scripts/export_native_safetensors.py \
-  checkpoints/step-013000 --output inference/model.safetensors
+python3 scripts/export_native_safetensors.py \
+  checkpoints/step-013000 --output model.safetensors
 
 # Generate
 ./target/release/lumi-infer generate \
-  -m inference/model.safetensors \
-  -c inference/config.json \
-  -t ../../tokenizer.json \
+  -m model.safetensors \
+  -c config.json \
+  -t tokenizer.json \
   -p "Once upon a time"
 ```
 
-### Inference Performance (M4 Pro, fp32)
+### Reference Performance (M4 Pro Metal, fp32)
 
 | Model | Speed |
 |-------|-------|

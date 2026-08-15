@@ -9,11 +9,12 @@ default = ["cpu"]
 cpu = []
 # Umbrella for "a GPU backend is compiled in". All GPU-side Rust is gated on
 # this, so backend selection is confined to build.rs and the runtime FFI names.
-gpu = []
-cuda = ["gpu"] # NVIDIA backend, kernels from csrc_cuda/ (retained, not active)
-hip = ["gpu"]  # AMD/ROCm backend, kernels from csrc_hip/
+gpu = ["lumi-kernels/gpu"]
+cuda = ["gpu", "lumi-kernels/cuda"] # NVIDIA backend, kernels from csrc_cuda/ (retained, not active)
+hip = ["gpu", "lumi-kernels/hip"]  # AMD/ROCm backend, kernels from csrc_hip/
 
 [dependencies]
+lumi-kernels = { path = "../kernels" }
 tokenizers = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,6 +23,3 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-[build-dependencies]
-cc = { version = "1", features = ["parallel"] }

@@ -1,120 +1,73 @@
-# Lumi Inference
+# Lumi Inference (Native HIP)
 
-Candle + Metal inference binary for Lumi models on Apple Silicon. O(1) memory per token via fixed SSM state (no growing KV cache for Mamba blocks).
+Native HIP inference for Lumi Mamba-3 models on AMD Radeon AI PRO R9700 (gfx1201 / RDNA4). No ML framework — direct kernel calls, safetensors weight loading, zero-copy device buffers.
 
-## Quick Start
+**Status:** Under construction. Kernel layer and host interface in progress. See [METAL_TO_HIP.md](METAL_TO_HIP.md) for the porting guide and staged implementation plan.
 
+## Quick Reference
+
+**Build:**
 ```bash
-# Build
-cd model && cargo build --release -p lumi-inference
+cargo build --release -p lumi-infer --features hip
+```
 
-# Generate text
-lumi-infer generate \
+**Generate:**
+```bash
+./target/release/lumi-infer generate \
   -m model.safetensors \
   -c config.json \
   -t tokenizer.json \
-  -p "Once upon a time" \
-  --max-tokens 200 \
-  --temperature 0.8
-
-# Run evaluation (perplexity + MC benchmarks)
-lumi-infer evaluate \
-  -m model.safetensors \
-  -c config.json \
-  -t tokenizer.json \
-  --val-data data/val.bin
+  -p "Once upon a time"
 ```
 
-Use `--cpu` (global flag, before subcommand) to force CPU instead of Metal GPU.
-
-## Exporting from Training Checkpoints
-
-Native training checkpoints must be converted to safetensors first:
-
+**Smoke test:**
 ```bash
-python3 scripts/export_native_safetensors.py <checkpoint_dir> --output model.safetensors
+./target/release/lumi-infer smoke
 ```
 
-The export script auto-transposes linear weights (`[in, out]` -> `[out, in]`) and reads block count from the checkpoint directory. Works for both 48-layer and 96-layer models.
+## How it Relates
 
-## Config File
-
-The config JSON must match the model architecture. Example for the 96-layer Phase 2 model:
-
-```json
-{
-  "d_model": 1024,
-  "n_layers": 96,
-  "d_state": 64,
-  "d_conv": 4,
-  "expand": 2,
-  "n_heads": 64,
-  "n_groups": 8,
-  "chunk_size": 256,
-  "vocab_size": 32000,
-  "max_seq_len": 1024,
-  "norm_eps": 1e-5,
-  "attention_interval": 0,
-  "attn_n_heads": 16,
-  "attn_kv_heads": 4,
-  "attn_mlp_expand": 4,
-  "byte_level": false
-}
-```
-
-Set `n_layers` to match the exported model (48 for base, 96 for doubled). Set `attention_interval > 0` for hybrid models (e.g. 8 = attention every 8th block).
-
-## CLI Reference
-
-### `generate`
-
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--model` | `-m` | required | Path to safetensors weights |
-| `--config` | `-c` | required | Path to model config JSON |
-| `--tokenizer` | `-t` | optional | Path to tokenizer JSON (omit for byte-level models) |
-| `--prompt` | `-p` | required | Input text |
-| `--max-tokens` | | 200 | Maximum tokens to generate |
-| `--temperature` | | 0.8 | Sampling temperature (<=0 for greedy argmax) |
-
-### `evaluate`
-
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--model` | `-m` | required | Path to safetensors weights |
-| `--config` | `-c` | required | Path to model config JSON |
-| `--tokenizer` | `-t` | optional | Path to tokenizer JSON (omit for byte-level models) |
-| `--val-data` | | `data/val.bin` | Validation data for perplexity |
-
-MC benchmarks (ARC-Easy, WinoGrande) are embedded in the binary — see `benchmarks/`. No external files required.
+- **[archive/metal-inference/](../archive/metal-inference/)** — Retired Candle+Metal implementation for Apple Silicon (M4 Pro). Kept for reference; not maintained.
+- **[METAL_TO_HIP.md](METAL_TO_HIP.md)** — Detailed porting guide: architectural decisions, kernel traps, staged verification gates, and performance notes. Start here if contributing.
 
 ## Architecture
 
-Each token is processed through `forward_step()` with persistent per-layer state:
+Mirrors the training binary's forward pass: device buffer management (`GpuBuf`), kernel launchers from `lumi-kernels`, safetensors weight loading. Single-token inference via persistent per-layer SSM state (`h`, `prev_bx`, cumulative DD-RoPE angles). O(1) memory per token — no growing KV cache even in hybrid Mamba+Attention configs.
 
-- **Mamba blocks**: O(1) SSM state (`h`, `prev_bx`, cumulative DD-RoPE angles). Full Mamba-3: data-dependent A, data-dependent lambda, DD-RoPE, trapezoidal discretization, BCNorm.
-- **Attention blocks** (hybrid mode): KV cache grows with sequence. Optional sliding window with FIFO truncation.
+## Weight Export
 
-Seven fused Metal kernels minimize dispatch overhead — the entire single-token generation path is 5 custom dispatches per Mamba block + 1 for logit projection:
+Training checkpoints must be converted to safetensors:
 
-| Kernel | What it replaces | Dispatches saved |
-|--------|-----------------|-----------------|
-| **RmsNormPipeline** | RMSNorm (sqr, mean, rsqrt, mul) | 3/block |
-| **GemvPipeline** | in_proj Linear (unsqueeze + MPS matmul + squeeze) | ~2/block |
-| **PreSsmPipeline** | ~35 ops (SiLU, BCNorm, softplus, sigmoid, group expansion, RoPE prep) | 34/block |
-| **SsmStepPipeline** | DD-RoPE + SSM scan + output contraction + Z-gate | already fused |
-| **GemvResidualPipeline** | out_proj Linear + residual add | ~3/block |
-| **SsmWindowPipeline** | Per-token SSM scan in eval (loops over full sequence in 1 dispatch) | N/window |
-| **GemvPipeline** (logit) | Final embedding^T projection | ~2/model |
+```bash
+python3 scripts/export_native_safetensors.py \
+  checkpoints/step-XXXXX --output model.safetensors
+```
 
-Performance on M4 Pro (Apple Silicon, fp32):
-- **48-layer (385M)**: ~79 tok/s generation
-- **96-layer (970M)**: ~45 tok/s generation
+See `scripts/export_native_safetensors.py` for format details.
 
-Falls back to CPU (Candle ops) if Metal is unavailable.
+## CLI Subcommands
 
-## Weight Compatibility
+### `generate`
 
-Loads safetensors exported via `scripts/export_native_safetensors.py`. Handles missing parameters gracefully:
-- `b_bias` / `c_bias`: defaults to ones (backward compat with older checkpoints)
-- `h_init`: defaults to zeros
+**Usage:** `lumi-infer generate -m MODEL -c CONFIG -t TOKENIZER -p PROMPT [options]`
+
+| Flag | Short | Required | Default | Description |
+|------|-------|----------|---------|-------------|
+| `--model` | `-m` | yes | — | Path to safetensors weights |
+| `--config` | `-c` | yes | — | Path to model config JSON |
+| `--tokenizer` | `-t` | no | — | Path to tokenizer JSON (omit for byte-level) |
+| `--prompt` | `-p` | yes | — | Input text |
+| `--max-tokens` | | no | 200 | Tokens to generate |
+| `--temperature` | | no | 0.8 | Sampling temp (≤0 for greedy) |
+
+### `smoke`
+
+Quick kernel test with minimal overhead. No model weights loaded.
+
+**Usage:** `lumi-infer smoke`
+
+## Dependencies
+
+- **lumi-kernels** — Shared kernel library (`kernels/` at workspace root). Built with `--features hip` for AMD HIP backend.
+- **hipcc / rocm-developer-tools** — HIP compiler and runtime.
+- **safetensors** — Weight format and loader.

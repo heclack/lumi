@@ -10,6 +10,16 @@ verification gate at each step.
 
 ---
 
+## Status
+
+The native HIP path (**Option A** in §2) was chosen. Implementation is underway in the `inference/` crate.
+Progress:
+- Shared kernel crate (`kernels/`, with `lumi-kernels`) now exists at the workspace root, containing `csrc_hip/`, `csrc_cuda/`, and FFI layer (`ops.rs`).
+- The Metal original is archived at `archive/metal-inference/` for reference.
+- See `inference/README.md` for current status and CLI design.
+
+---
+
 ## 1. Two findings that reshape the job
 
 ### 1.1 Candle has no AMD backend

@@ -1,3 +1,4 @@
 [workspace]
-members = ["training", "inference"]
+members = ["kernels", "training", "inference"]
+exclude = ["archive/metal-inference"]
 resolver = "2"

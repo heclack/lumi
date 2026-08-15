@@ -1,0 +1,14 @@
+[package]
+name = "lumi-kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Shared GPU kernels (HIP/CUDA) and device buffers for Lumi training and inference"
+
+[features]
+default = []
+gpu = []
+cuda = ["gpu"]
+hip = ["gpu"]
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
