@@ -235,7 +235,7 @@ unsafe fn mamba_block_forward(
     // dd_A: split + neg_softplus_clamp
     let dd_a_offset = lambda_offset + n_heads;
     native_ops::strided_split(projected, dst.dd_a_raw, bs, in_proj_out, dd_a_offset, n_heads);
-    native_ops::neg_softplus_clamp(dst.dd_a_raw, a_vals_buf, -1e6, -1e-4, bs * n_heads);
+    native_ops::neg_softplus_clamp(dst.dd_a_raw, a_vals_buf, native_ops::A_VAL_CLAMP_MIN, native_ops::A_VAL_CLAMP_MAX, bs * n_heads);
 
     // DD-RoPE: theta split
     let theta_offset = dd_a_offset + n_heads;
@@ -861,7 +861,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
                 unsafe {
                     cuda_convert_bf16_to_f32(buf.bwd_stage_a.ptr, saved.dd_a_raw.ptr, bs * n_heads);
                     native_ops::neg_softplus_clamp(
-                        buf.bwd_stage_a.ptr, buf.a_vals_buf.ptr, -1e6, -1e-4, (bs * n_heads) as i32,
+                        buf.bwd_stage_a.ptr, buf.a_vals_buf.ptr, native_ops::A_VAL_CLAMP_MIN, native_ops::A_VAL_CLAMP_MAX, (bs * n_heads) as i32,
                     );
                 }
 
@@ -1065,7 +1065,7 @@ pub fn train_native(config: &TrainingConfig, device_id: i32) {
 
             // Recompute A_vals for this layer (shared a_vals_buf only has last layer's values)
             unsafe {
-                native_ops::neg_softplus_clamp(buf.saved[idx].dd_a_raw.ptr, buf.a_vals_buf.ptr, -1e6, -1e-4, (bs * n_heads) as i32);
+                native_ops::neg_softplus_clamp(buf.saved[idx].dd_a_raw.ptr, buf.a_vals_buf.ptr, native_ops::A_VAL_CLAMP_MIN, native_ops::A_VAL_CLAMP_MAX, (bs * n_heads) as i32);
             }
 
             // SSM backward (GPU-direct) — uses saved activations

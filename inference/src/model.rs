@@ -6,7 +6,7 @@
 /// direct kernel calls on `GpuBuf`s — the same translation
 /// `training/src/native_trainer.rs::mamba_block_forward` already did for the
 /// training/windowed path, which this module steals its idioms from.
-use lumi_kernels::buf::{cuda_memcpy, GpuBuf};
+use lumi_kernels::buf::{memcpy_d2d, memcpy_h2d, GpuBuf};
 use lumi_kernels::ops;
 
 use crate::config::ModelConfig;
@@ -92,7 +92,7 @@ impl Model {
     /// `GpuBuf` is nominally an f32 buffer, but `embedding_lookup` wants
     /// `*const i32` token ids. Following `upload_batch` in
     /// `training/src/native_trainer.rs`, we reinterpret the single 4-byte slot:
-    /// copy the i32's raw bytes in via `cuda_memcpy`, then hand the same
+    /// copy the i32's raw bytes in via `memcpy_h2d`, then hand the same
     /// pointer to the kernel cast as `*const i32`.
     fn embed_token(&mut self, token_id: u32) {
         let id = token_id as i32;
@@ -101,11 +101,10 @@ impl Model {
             // i32 (4 bytes). f32 and i32 share size and alignment, so writing
             // the i32's bit pattern into the f32 slot and reading it back out
             // as `*const i32` in embedding_lookup below is a sound reinterpret.
-            cuda_memcpy(
+            memcpy_h2d(
                 self.token_id_dev.ptr as *mut std::ffi::c_void,
                 (&id as *const i32) as *const std::ffi::c_void,
                 4,
-                1, // hipMemcpyHostToDevice
             );
             ops::embedding_lookup(
                 self.weights.embedding.ptr,
@@ -143,11 +142,10 @@ impl Model {
             // SAFETY: residual and x are both [d_model]-element GpuBufs
             // (allocated together in `new`), so copying d_model elements
             // device-to-device stays within both allocations.
-            cuda_memcpy(
+            memcpy_d2d(
                 self.residual.ptr as *mut std::ffi::c_void,
                 self.x.ptr as *const std::ffi::c_void,
                 d_model as usize * 4,
-                3, // hipMemcpyDeviceToDevice
             );
         }
 
@@ -203,7 +201,7 @@ impl Model {
             // applies softplus(dt+dt_bias) and tanh(theta)*pi internally (see
             // its doc comment in kernels/src/ops.rs).
             ops::sigmoid_fwd(lambda_ptr, self.lambda_buf.ptr, n_heads);
-            ops::neg_softplus_clamp(dd_a_ptr, self.a_vals_buf.ptr, -1e6, -1e-4, n_heads);
+            ops::neg_softplus_clamp(dd_a_ptr, self.a_vals_buf.ptr, ops::A_VAL_CLAMP_MIN, ops::A_VAL_CLAMP_MAX, n_heads);
             ops::silu_fwd(x_ssm_ptr, self.x_act.ptr, d_inner);
 
             // 6. Single-token SSM step: mutates state.h / state.prev_bx /

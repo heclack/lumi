@@ -69,15 +69,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_generate(args: &GenerateArgs) -> anyhow::Result<()> {
-    let GenerateArgs { weights: weights_path, config: config_path, tokenizer: tokenizer_path, prompt, max_tokens, temperature, top_k, seed } = args;
-    let max_tokens = *max_tokens;
-    let temperature = *temperature;
-    let top_k = *top_k;
-    let seed = *seed;
-    let tokenizer_path = tokenizer_path.as_deref();
-
-    eprintln!("Loading config: {config_path}");
-    let model_config: ModelConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    eprintln!("Loading config: {}", args.config);
+    let model_config: ModelConfig = serde_json::from_str(&std::fs::read_to_string(&args.config)?)?;
     model_config.validate()?;
     eprintln!(
         "Model: d_model={}, layers={}, heads={}, vocab={}{}",
@@ -88,29 +81,27 @@ fn run_generate(args: &GenerateArgs) -> anyhow::Result<()> {
         if model_config.byte_level { " (byte-level)" } else { "" }
     );
 
-    eprintln!("Loading weights: {weights_path}");
-    let model_weights = weights::ModelWeights::load(weights_path, &model_config)?;
+    eprintln!("Loading weights: {}", args.weights);
+    let model_weights = weights::ModelWeights::load(&args.weights, &model_config)?;
     eprintln!("Weights loaded.");
 
+    // Model::new resets all SSM state; a future multi-prompt loop would call
+    // model.reset_state() between prompts.
     let mut model = Model::new(model_config, model_weights);
-    // Model::new already resets state, but do it explicitly here too — this is
-    // the start of a fresh generation, and a caller that later turns this
-    // function into a multi-prompt loop needs exactly this call between prompts.
-    model.reset_state();
 
     // Encode the prompt and pick an eos id, based on the config's tokenization mode.
     let byte_level = model.config().byte_level;
     let (prompt_ids, eos_id, tok): (Vec<u32>, u32, Option<tokenizers::Tokenizer>) =
         if byte_level {
-            let ids: Vec<u32> = prompt.as_bytes().iter().map(|&b| b as u32 + 3).collect();
+            let ids: Vec<u32> = args.prompt.as_bytes().iter().map(|&b| b as u32 + 3).collect();
             (ids, 2u32, None)
         } else {
-            let tok_path = tokenizer_path
+            let tok_path = args.tokenizer.as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--tokenizer is required (config is not byte_level)"))?;
             let tok = tokenizers::Tokenizer::from_file(tok_path)
                 .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
             let encoding = tok
-                .encode(prompt.as_str(), false)
+                .encode(args.prompt.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("failed to encode prompt: {e}"))?;
             let ids = encoding.get_ids().to_vec();
             let eos = tok.token_to_id("<eos>").unwrap_or(2);
@@ -130,7 +121,7 @@ fn run_generate(args: &GenerateArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mut sampler = Sampler::new(temperature, top_k, seed);
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.seed);
 
     unsafe {
         ops::cublas_init();
@@ -151,13 +142,13 @@ fn run_generate(args: &GenerateArgs) -> anyhow::Result<()> {
         prompt_ids.len() as f64 / prompt_time.as_secs_f64().max(1e-9)
     );
 
-    print!("{prompt}");
+    print!("{}", args.prompt);
     use std::io::Write;
     std::io::stdout().flush()?;
 
     let mut generated = 0usize;
     let gen_start = std::time::Instant::now();
-    for _ in 0..max_tokens {
+    for _ in 0..args.max_tokens {
         let logits = match last_logits.take() {
             Some(l) => l,
             None => break, // empty prompt — nothing to seed generation with
@@ -207,14 +198,17 @@ fn run_smoke(config_path: Option<&str>) -> anyhow::Result<()> {
             cfg
         }
         None => {
-            eprintln!("No config given — using smoke default (d_model=256, n_layers=4, d_state=64)");
+            eprintln!("No config given — using smoke default");
             ModelConfig::smoke_default()
         }
     };
     model_config.validate()?;
+    // Printed from the constructed config, so this can't go stale if
+    // smoke_default's values change.
     eprintln!(
-        "Model: d_model={}, layers={}, heads={}, vocab={}",
-        model_config.d_model, model_config.n_layers, model_config.n_heads, model_config.vocab_size
+        "Model: d_model={}, layers={}, heads={}, d_state={}, vocab={}",
+        model_config.d_model, model_config.n_layers, model_config.n_heads,
+        model_config.d_state, model_config.vocab_size
     );
 
     eprintln!("Building random weights (seed=42)...");
@@ -226,6 +220,8 @@ fn run_smoke(config_path: Option<&str>) -> anyhow::Result<()> {
     }
 
     // Autoregressive decode from bos=1, feeding each argmax token back in.
+    // temperature 0 makes Sampler greedy — same argmax path generate uses.
+    let mut sampler = Sampler::new(0.0, None, 0);
     let mut token_id = 1u32; // bos
     let mut argmax_ids = Vec::with_capacity(16);
     for step in 0..16 {
@@ -233,12 +229,7 @@ fn run_smoke(config_path: Option<&str>) -> anyhow::Result<()> {
         let all_finite = logits.iter().all(|v| v.is_finite());
         anyhow::ensure!(all_finite, "step {step}: logits contain non-finite values");
 
-        let next = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .expect("logits is non-empty");
+        let next = sampler.sample(&logits);
         argmax_ids.push(next);
         token_id = next;
     }

@@ -27,12 +27,15 @@ impl Sampler {
             logits.iter().map(|&l| l / self.temperature as f32).collect();
 
         // Top-k: zero out (via -inf) every logit outside the k highest, so the
-        // softmax below assigns them no probability mass.
+        // softmax below assigns them no probability mass. The threshold is the
+        // k-th largest value — O(V) selection, no need to sort the whole vocab.
         if let Some(k) = self.top_k {
             if k > 0 && k < scaled.len() {
-                let mut sorted = scaled.clone();
-                sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                let threshold = sorted[k - 1];
+                let mut sel = scaled.clone();
+                let (_, kth, _) = sel.select_nth_unstable_by(k - 1, |a, b| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let threshold = *kth;
                 for v in scaled.iter_mut() {
                     if *v < threshold {
                         *v = f32::NEG_INFINITY;
@@ -41,20 +44,24 @@ impl Sampler {
             }
         }
 
+        // Softmax in place: `scaled` becomes the (unnormalized) exp weights.
         let max = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = scaled.iter().map(|&v| (v - max).exp()).collect();
-        let sum: f32 = exps.iter().sum();
+        let mut sum = 0.0f32;
+        for v in scaled.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
 
         // Inverse-CDF sampling over the (renormalized) softmax distribution.
         let r: f32 = self.rng.gen_range(0.0..1.0);
         let mut cumsum = 0.0f32;
-        for (i, &e) in exps.iter().enumerate() {
+        for (i, &e) in scaled.iter().enumerate() {
             cumsum += e / sum;
             if cumsum >= r {
                 return i as u32;
             }
         }
-        (exps.len() - 1) as u32
+        (scaled.len() - 1) as u32
     }
 }
 

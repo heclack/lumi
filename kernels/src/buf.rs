@@ -213,6 +213,22 @@ pub unsafe fn cuda_memcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_vo
                       count: usize, kind: i32) -> i32 {
     cudaMemcpy(dst, src, count, kind)
 }
+
+// Named direction wrappers so call sites never touch the numeric memcpy
+// `kind` codes (shared by CUDA and HIP: H2D=1, D2H=2, D2D=3). Prefer these —
+// or the GpuBuf methods above — over raw cuda_memcpy with a bare kind.
+/// Copy `bytes` bytes host → device.
+pub unsafe fn memcpy_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) -> i32 {
+    cuda_memcpy(dst, src, bytes, 1)
+}
+/// Copy `bytes` bytes device → host.
+pub unsafe fn memcpy_d2h(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) -> i32 {
+    cuda_memcpy(dst, src, bytes, 2)
+}
+/// Copy `bytes` bytes device → device.
+pub unsafe fn memcpy_d2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) -> i32 {
+    cuda_memcpy(dst, src, bytes, 3)
+}
 pub unsafe fn cuda_memset(ptr: *mut std::ffi::c_void, value: i32, count: usize) -> i32 {
     cudaMemset(ptr, value, count)
 }

@@ -15,40 +15,14 @@
  *   - Learned h_init: per-head initial hidden state
  */
 
-#include "ssm_scan.h"
+#include "ssm_scan.h" // also provides the shared device helpers:
+                      // LOG2E, wave32 assert, cos/sin_approx, softplus
 #include <cmath>
 #include <cstdio>
-
-#define LOG2E 1.44269504089f
-
-/* This port hardcodes a 32-lane warp everywhere (matching the original CUDA).
- * RDNA (gfx10+) defaults to wave32 for compute, so the shuffle reductions below
- * are correct as written -- but would break silently if ever built for wave64.
- * Guarded to the device pass; the macro reads 64 during host compilation. */
-#ifdef __HIP_DEVICE_COMPILE__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-pragma"
-static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
-              "These kernels assume a 32-lane wavefront; build with wave32 (RDNA default).");
-#pragma clang diagnostic pop
-#endif
 
 /* HIP's *_sync warp primitives require a 64-bit mask; it is narrowed to the low
  * 32 bits automatically on wave32. */
 #define FULL_WARP_MASK 0xffffffffffffffffULL
-
-/* Was PTX cos.approx.f32 / sin.approx.f32. __cosf/__sinf are the HIP fast-math
- * equivalents, lowering to the v_cos_f32/v_sin_f32 hardware instructions. */
-__device__ __forceinline__ float cos_approx(float x) {
-    return __cosf(x);
-}
-__device__ __forceinline__ float sin_approx(float x) {
-    return __sinf(x);
-}
-
-__device__ __forceinline__ float softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + exp2f(x * LOG2E));
-}
 
 /* Block-level sum reduction: warp shuffle + shared memory inter-warp reduce.
  * Returns the sum in thread 0 only; other threads get undefined value.

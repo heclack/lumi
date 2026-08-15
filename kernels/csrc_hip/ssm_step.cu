@@ -18,34 +18,9 @@
  * Metal original's early-return-then-barrier pattern is UB in HIP.
  */
 
+#include "ssm_scan.h" // shared device helpers: LOG2E, cos/sin_approx, softplus
 #include <cmath>
 #include <cstdio>
-
-#define LOG2E 1.44269504089f
-
-/* Hardcodes a 32-lane warp, matching ssm_scan.cu. RDNA (gfx10+) defaults to
- * wave32 for compute. Guarded to the device pass; the macro reads 64 during
- * host compilation. */
-#ifdef __HIP_DEVICE_COMPILE__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-pragma"
-static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
-              "These kernels assume a 32-lane wavefront; build with wave32 (RDNA default).");
-#pragma clang diagnostic pop
-#endif
-
-/* --- Device helpers, copied verbatim from ssm_scan.cu for identical numerics --- */
-
-__device__ __forceinline__ float cos_approx(float x) {
-    return __cosf(x);
-}
-__device__ __forceinline__ float sin_approx(float x) {
-    return __sinf(x);
-}
-
-__device__ __forceinline__ float softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + exp2f(x * LOG2E));
-}
 
 /* --- Single-timestep SSM step kernel ------------------------------------- */
 

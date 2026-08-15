@@ -207,32 +207,6 @@ extern "C" {
         chunk_size: i32,
     );
 
-    // ─── SSM Single-Token Step (inference decode; HIP only for now) ───
-    /// One timestep of the selective scan with persistent state, for
-    /// autoregressive decoding. Numerics match ssm_scan_fwd_gpu exactly:
-    ///   dt_pos = softplus(dt + dt_bias);  a_bar = exp(A_val * dt_pos)
-    ///   DD-RoPE: cum_angle[k] += dt_pos * tanh(theta[k]) * pi (mod 2pi),
-    ///            B/C rotated pairwise by cum_angle
-    ///   h = a_bar*h + (1-lambda)*a_bar*prev_bx + lambda*(b (x) x)
-    ///   y = C.h + D*x, gated by silu(z) when z is non-null
-    ///
-    /// b/c are GROUP-level [n_groups * d_state] (post-BCNorm); the kernel
-    /// indexes group = head / (n_heads / n_groups) — no host-side expansion.
-    /// dt/lambda/a_vals are [n_heads]: dt raw, lambda post-sigmoid, a_vals
-    /// post neg-softplus-clamp (same conventions as the training scan).
-    /// State (updated in place):
-    ///   h, prev_bx: [n_heads, head_dim, d_state]; cum_angle: [n_heads, d_state/2]
-    /// Requires d_state == 64 (checked in the launcher; fails loudly).
-    pub fn ssm_step_gpu(
-        x: *const f32, dt: *const f32, b: *const f32, c: *const f32,
-        d_skip: *const f32, dt_bias: *const f32,
-        lambda: *const f32, theta: *const f32, a_vals: *const f32,
-        z: *const f32,
-        h: *mut f32, prev_bx: *mut f32, cum_angle: *mut f32,
-        y: *mut f32,
-        n_heads: i32, head_dim: i32, d_state: i32, n_groups: i32,
-    );
-
     // ─── BF16 Mixed-Precision Matmuls ───
     pub fn convert_f32_to_bf16(input: *const f32, output: *mut u16, n: i32);
     pub fn convert_bf16_to_f32(input: *const u16, output: *mut f32, n: i32);
@@ -266,6 +240,46 @@ extern "C" {
         A: *const f32, B: *const f32, C: *mut f32,
         scratch_a: *mut u16, scratch_b: *mut u16,
         m: i32, n: i32, k: i32, batch_count: i32,
+    );
+}
+
+/// Clamp bounds for the data-dependent A projection: A = -softplus(dd_A)
+/// clamped to [A_VAL_CLAMP_MIN, A_VAL_CLAMP_MAX]. Strictly negative so
+/// a_bar = exp(A * dt_pos) is a decay factor in (0, 1). The single source of
+/// truth for every `neg_softplus_clamp` call site in training and inference —
+/// retune here, not at the call sites.
+pub const A_VAL_CLAMP_MIN: f32 = -1e6;
+pub const A_VAL_CLAMP_MAX: f32 = -1e-4;
+
+// ─── SSM Single-Token Step (inference decode) ───
+// HIP-only: build.rs compiles csrc_hip/ssm_step.cu only in the hip branch, so
+// the declaration is gated the same way — a cuda-only build that somehow
+// called this should fail at compile time, not at final link.
+#[cfg(feature = "hip")]
+extern "C" {
+    /// One timestep of the selective scan with persistent state, for
+    /// autoregressive decoding. Numerics match ssm_scan_fwd_gpu exactly:
+    ///   dt_pos = softplus(dt + dt_bias);  a_bar = exp(A_val * dt_pos)
+    ///   DD-RoPE: cum_angle[k] += dt_pos * tanh(theta[k]) * pi (mod 2pi),
+    ///            B/C rotated pairwise by cum_angle
+    ///   h = a_bar*h + (1-lambda)*a_bar*prev_bx + lambda*(b (x) x)
+    ///   y = C.h + D*x, gated by silu(z) when z is non-null
+    ///
+    /// b/c are GROUP-level [n_groups * d_state] (post-BCNorm); the kernel
+    /// indexes group = head / (n_heads / n_groups) — no host-side expansion.
+    /// dt/lambda/a_vals are [n_heads]: dt raw, lambda post-sigmoid, a_vals
+    /// post neg-softplus-clamp (same conventions as the training scan).
+    /// State (updated in place):
+    ///   h, prev_bx: [n_heads, head_dim, d_state]; cum_angle: [n_heads, d_state/2]
+    /// Requires d_state == 64 (checked in the launcher; fails loudly).
+    pub fn ssm_step_gpu(
+        x: *const f32, dt: *const f32, b: *const f32, c: *const f32,
+        d_skip: *const f32, dt_bias: *const f32,
+        lambda: *const f32, theta: *const f32, a_vals: *const f32,
+        z: *const f32,
+        h: *mut f32, prev_bx: *mut f32, cum_angle: *mut f32,
+        y: *mut f32,
+        n_heads: i32, head_dim: i32, d_state: i32, n_groups: i32,
     );
 }
 

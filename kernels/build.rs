@@ -10,7 +10,7 @@ fn main() {
         // Target the installed GPU. gfx1201 is RDNA4 (Radeon AI PRO R9700).
         // Override with e.g. HIP_ARCH=gfx1100 to build for a different card.
         let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1201".to_string());
-        build.flag(&format!("--offload-arch={}", arch));
+        build.flag(format!("--offload-arch={}", arch));
 
         // The kernels hardcode a 32-lane warp (see the static_assert in
         // ssm_scan.cu). Wave32 is the RDNA default, but state it explicitly so a
