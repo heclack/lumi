@@ -13,3 +13,7 @@ checkpoints/
 
 # Environment
 .env
+
+# test data
+data
+config-shakespeare.json
